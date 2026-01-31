@@ -29,6 +29,38 @@ const CONFIG = {
   MAX_USERNAME_LENGTH: 50,
 };
 
+// Room ID / Invite generation constants
+const ROOM_CONSTS = {
+  INVITE_CHARS: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+  INVITE_LENGTH: 6,
+  ROOM_ID_CHARS: 'abcdefghijklmnopqrstuvwxyz0123456789',
+  ROOM_ID_PREFIX: 'room_',
+  ROOM_ID_LENGTH: 12,
+  INVITE_LINK_PREFIX: 'omeglelol://join-room/',
+  DEFAULT_MAX_MEMBERS: 100,
+};
+
+function generateInviteCode() {
+  let code = '';
+  for (let i = 0; i < ROOM_CONSTS.INVITE_LENGTH; i++) {
+    code += ROOM_CONSTS.INVITE_CHARS.charAt(Math.floor(Math.random() * ROOM_CONSTS.INVITE_CHARS.length));
+  }
+  return code;
+}
+
+function generateRoomId() {
+  let id = ROOM_CONSTS.ROOM_ID_PREFIX;
+  for (let i = 0; i < ROOM_CONSTS.ROOM_ID_LENGTH; i++) {
+    id += ROOM_CONSTS.ROOM_ID_CHARS.charAt(Math.floor(Math.random() * ROOM_CONSTS.ROOM_ID_CHARS.length));
+  }
+  return id;
+}
+
+// In-memory rooms store: roomId -> room object
+// room object fields: roomId, roomName, creatorId, creatorName, description,
+// roomType ('public'|'private'), inviteCode, inviteLink, createdAt, memberIds (userIds), maxMembers, status
+const rooms = new Map();
+
 // ========== STATE MANAGEMENT ==========
 const videoPairings = new Map(); // socket.id -> { peerId, userData }
 const chatPairings = new Map();
@@ -241,11 +273,30 @@ io.on('connection', (socket) => {
       }
 
       // Store complete user data including avatar info
+      // Normalize possible profile image keys from clients
+      const profileImageCandidates = [
+        'profileImagePath',
+        'profile_image_path',
+        'profileImage',
+        'profile_pic',
+        'photo',
+        'avatarUrl',
+        'img',
+      ];
+      let profileImagePath = null;
+      for (const k of profileImageCandidates) {
+        if (userData[k]) {
+          profileImagePath = userData[k];
+          break;
+        }
+      }
+
       socketMetadata.set(socket.id, {
         userId: userData.userId,
         userName: userData.userName,
         avatarColor: userData.avatarColor || '#128C7E',
         avatarLetter: userData.avatarLetter || userData.userName[0].toUpperCase(),
+        profileImagePath: profileImagePath || null,
         joinedAt: Date.now(),
       });
 
@@ -259,6 +310,181 @@ io.on('connection', (socket) => {
     } catch (error) {
       Logger.error('register_user', 'Error registering user', error.message);
       socket.emit('error', { message: 'Registration failed' });
+    }
+  });
+
+  // ========== GROUP ROOM EVENTS ==========
+  // Create a new room (public/private)
+  socket.on('create_room', (data, callback) => {
+    try {
+      const meta = socketMetadata.get(socket.id);
+      if (!meta) {
+        const err = 'User not registered';
+        if (callback) callback({ success: false, error: err });
+        return;
+      }
+
+      const roomName = (data && data.roomName) ? String(data.roomName).trim() : null;
+      if (!roomName) {
+        if (callback) callback({ success: false, error: 'Invalid room name' });
+        return;
+      }
+
+      const roomType = (data && data.roomType) === 'public' ? 'public' : 'private';
+      const maxMembers = (data && Number.isInteger(data.maxMembers) && data.maxMembers > 0) ? data.maxMembers : ROOM_CONSTS.DEFAULT_MAX_MEMBERS;
+
+      const inviteCode = roomType === 'private' ? generateInviteCode() : null;
+      const inviteLink = inviteCode ? ROOM_CONSTS.INVITE_LINK_PREFIX + inviteCode : null;
+      const roomId = generateRoomId();
+
+      const room = {
+        roomId,
+        roomName,
+        creatorId: meta.userId,
+        creatorName: meta.userName,
+        description: (data && data.description) ? String(data.description).trim() : null,
+        roomType,
+        inviteCode,
+        inviteLink,
+        createdAt: new Date().toISOString(),
+        memberIds: [meta.userId],
+        maxMembers,
+        status: 'active',
+      };
+
+      rooms.set(roomId, room);
+
+      Logger.info('create_room', 'Room created', {
+        roomId,
+        roomName,
+        roomType,
+        inviteCode,
+        creatorId: meta.userId,
+        totalRooms: rooms.size,
+      });
+
+      // Inform caller
+      if (callback) callback({ success: true, room });
+
+      // Broadcast updated public rooms list
+      if (roomType === 'public') {
+        io.emit('rooms_updated', { type: 'public', rooms: Array.from(rooms.values()).filter(r => r.roomType === 'public' && r.status === 'active') });
+      }
+    } catch (error) {
+      Logger.error('create_room', 'Error creating room', error.message);
+      if (callback) callback({ success: false, error: 'Failed to create room' });
+    }
+  });
+
+  // Join a room by invite code or roomId
+  socket.on('join_room', (data, callback) => {
+    try {
+      const inviteCode = data && data.inviteCode ? String(data.inviteCode).trim() : null;
+      const roomId = data && data.roomId ? String(data.roomId).trim() : null;
+      
+      Logger.info('join_room', 'Received join request', {
+        socketId: socket.id,
+        inviteCode,
+        roomId,
+      });
+
+      const meta = socketMetadata.get(socket.id) || {};
+      const userId = meta.userId;
+      
+      if (!userId) {
+        Logger.warn('join_room', 'User not registered for this socket', {
+          socketId: socket.id,
+          registeredUsers: Array.from(socketMetadata.keys()),
+        });
+        if (callback) callback({ success: false, error: 'User not registered' });
+        return;
+      }
+
+      let room = null;
+      if (inviteCode) {
+        Logger.info('join_room', 'Searching for room by inviteCode', {
+          searchCode: inviteCode.toUpperCase(),
+          totalRooms: rooms.size,
+          roomCodes: Array.from(rooms.values()).map(r => ({
+            roomId: r.roomId,
+            inviteCode: r.inviteCode,
+            status: r.status,
+          })),
+        });
+
+        for (const r of rooms.values()) {
+          if (r.inviteCode && r.inviteCode.toUpperCase() === inviteCode.toUpperCase() && r.status === 'active') {
+            room = r;
+            Logger.info('join_room', 'Room found by inviteCode', {
+              roomId: r.roomId,
+              roomName: r.roomName,
+            });
+            break;
+          }
+        }
+
+        if (!room) {
+          Logger.warn('join_room', 'Room not found by inviteCode', {
+            searchedCode: inviteCode.toUpperCase(),
+            totalRooms: rooms.size,
+          });
+        }
+      } else if (roomId) {
+        room = rooms.get(roomId) || null;
+        if (room && room.status !== 'active') room = null;
+      }
+
+      if (!room) {
+        if (callback) callback({ success: false, error: 'Room not found' });
+        return;
+      }
+
+      if (room.memberIds.includes(userId)) {
+        if (callback) callback({ success: true, room });
+        return;
+      }
+
+      if (room.memberIds.length >= room.maxMembers) {
+        if (callback) callback({ success: false, error: 'Room is full' });
+        return;
+      }
+
+      room.memberIds.push(userId);
+      rooms.set(room.roomId, room);
+
+      Logger.info('join_room', 'User joined room', { roomId: room.roomId, userId });
+
+      // Notify all room members (including the new member) of the update
+      const newMemberName = meta.userName;
+      const totalMembers = room.memberIds.length;
+      
+      for (const memberId of room.memberIds) {
+        const memberSocketId = userSockets.get(memberId);
+        if (memberSocketId) {
+          io.to(memberSocketId).emit('room_member_joined', { 
+            roomId: room.roomId, 
+            newMemberId: userId,
+            newMemberName: newMemberName,
+            totalMembers: totalMembers
+          });
+        }
+      }
+
+      if (callback) callback({ success: true, room });
+    } catch (error) {
+      Logger.error('join_room', 'Error joining room', error.message);
+      if (callback) callback({ success: false, error: 'Failed to join room' });
+    }
+  });
+
+  // List public rooms (simple discovery)
+  socket.on('list_public_rooms', (data, callback) => {
+    try {
+      const publicRooms = Array.from(rooms.values()).filter(r => r.roomType === 'public' && r.status === 'active');
+      if (callback) callback({ success: true, rooms: publicRooms });
+    } catch (error) {
+      Logger.error('list_public_rooms', 'Error listing public rooms', error.message);
+      if (callback) callback({ success: false, error: 'Failed to list rooms' });
     }
   });
 
