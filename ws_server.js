@@ -1,7 +1,6 @@
 const express = require('express');
 const http = require('http');
 const socketIO = require('socket.io');
-const cors = require('cors');
 
 const app = express();
 const server = http.createServer(app);
@@ -17,26 +16,6 @@ const io = socketIO(server, {
   pingInterval: 15000, // ✅ Reduced from 25000 for faster detection
   pingTimeout: 45000,  // ✅ Reduced from 60000
 });
-
-// ✅ IMPROVED: Centralized error response formatter
-function sendErrorResponse(socket, event, code, message, details = null) {
-  const errorResponse = {
-    success: false,
-    error: {
-      code: code,
-      message: message,
-      timestamp: new Date().toISOString(),
-    },
-  };
-  if (details) {
-    errorResponse.error.details = details;
-  }
-  if (event) {
-    socket.emit(event, errorResponse);
-  }
-  Logger.error(event || 'error', message, details);
-  return errorResponse;
-}
 
 // Simple lookup endpoint to help debug join-by-invite behavior from clients
 app.get('/room/by-invite/:code', (req, res) => {
@@ -86,10 +65,71 @@ app.get('/room/by-invite/:code', (req, res) => {
   }
 });
 
+// Google OAuth Token Validation Endpoint (No Firebase required)
+app.post('/auth/validate-token', async (req, res) => {
+  try {
+    const { idToken } = req.body;
+
+    if (!idToken) {
+      return res.status(400).json({
+        success: false,
+        error: 'ID token is required',
+      });
+    }
+
+    // Validate token with Google's API
+    const tokenResponse = await fetch('https://www.googleapis.com/oauth2/v3/tokeninfo', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ id_token: idToken }),
+    });
+
+    if (!tokenResponse.ok) {
+      Logger.warn(
+        'oauth/validate',
+        `Token validation failed: ${tokenResponse.status}`,
+        { status: tokenResponse.status }
+      );
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid or expired token',
+        code: 'INVALID_TOKEN',
+      });
+    }
+
+    const tokenData = await tokenResponse.json();
+
+    Logger.info('oauth/validate', '✅ Token validated successfully', {
+      userId: tokenData.sub,
+      email: tokenData.email,
+      emailVerified: tokenData.email_verified,
+    });
+
+    return res.json({
+      success: true,
+      message: 'Token is valid',
+      user: {
+        id: tokenData.sub,
+        email: tokenData.email,
+        emailVerified: tokenData.email_verified === 'true',
+        name: tokenData.name,
+        picture: tokenData.picture,
+      },
+    });
+  } catch (err) {
+    Logger.error('oauth/validate', 'Error validating token', err && err.message);
+    return res.status(500).json({
+      success: false,
+      error: 'Token validation error',
+      details: err && err.message,
+    });
+  }
+});
+
 // ========== CONFIGURATION ==========
 const CONFIG = {
   PORT: process.env.PORT || 8080,
-  SERVER_IP: process.env.SERVER_IP || '10.140.140.221', // Legacy config key (used by some deploys)
+  SERVER_IP: process.env.SERVER_IP || '127.0.0.1', // Local default address
   // Host/interface to bind the HTTP server to (defaults to all interfaces)
   SERVER_BIND: process.env.SERVER_BIND || '0.0.0.0',
   STALE_TIMEOUT: 5 * 60 * 1000, // 5 minutes
@@ -172,6 +212,9 @@ const userSockets = new Map(); // userId -> socketId
 const socketMetadata = new Map(); // socketId -> { userId, userName, joinedAt }
 const socketQueues = new Map(); // socket.id -> 'video' | 'chat' (track which queue user is in)
 const rateLimitMap = new Map(); // socketId -> { count, resetTime } for abuse prevention
+// Star gifting state: counts per room or match and one-time gift tracking
+const starCounts = new Map(); // key -> number (roomId or matchId)
+const oneTimeGifts = new Set(); // `${socketId}:${key}` to prevent duplicate gifts
 
 // ========== RATE LIMITING ==========
 const RATE_LIMIT_CONFIG = {
@@ -339,23 +382,55 @@ function attemptMatch(roomType = 'video') {
       return false;
     }
 
+    // ✅ CRITICAL: Prevent self-pairing (same socket matched with itself)
+    if (user1.socketId === user2.socketId) {
+      Logger.warn('attemptMatch', 'Attempted self-pairing, requeuing both', {
+        socketId: user1.socketId,
+        roomType,
+      });
+      // Requeue both to end of queue to avoid immediate re-matching
+      queue.push(user1);
+      queue.push(user2);
+      return false;
+    }
+
     Logger.info('attemptMatch', `Matched ${roomType} pair`, {
       user1Id: user1.socketId,
       user1Name: user1.userData?.userName,
+      user1DataValid: user1.userData ? 'YES' : 'NULL',
       user2Id: user2.socketId,
       user2Name: user2.userData?.userName,
+      user2DataValid: user2.userData ? 'YES' : 'NULL',
     });
 
-    // Create pairing
+    // ✅ DEFENSIVE: Ensure userData is always valid (fallback if not)
+    const ensureUserData = (userData, socketId) => {
+      if (!userData) {
+        Logger.warn('attemptMatch', 'userData missing, creating fallback', { socketId });
+        return {
+          userId: `user_${socketId.substring(0, 8)}`,
+          userName: `User_${socketId.substring(0, 8)}`,
+          avatarColor: '#128C7E',
+          avatarLetter: 'U',
+          profileImagePath: null,
+        };
+      }
+      return userData;
+    };
+
+    const user1DataValid = ensureUserData(user1.userData, user1.socketId);
+    const user2DataValid = ensureUserData(user2.userData, user2.socketId);
+
+    // Create pairing with validated user data
     const matchId = generateMatchId();
     pairings.set(user1.socketId, {
       peerId: user2.socketId,
-      userData: user2.userData,
+      userData: user2DataValid,
       matchId,
     });
     pairings.set(user2.socketId, {
       peerId: user1.socketId,
-      userData: user1.userData,
+      userData: user1DataValid,
       matchId,
     });
     socketQueues.delete(user1.socketId);
@@ -365,7 +440,7 @@ function attemptMatch(roomType = 'video') {
     const iceServers = buildIceServers();
     const matchedData1 = {
       peers: [user1.socketId, user2.socketId],
-      remoteUser: user2.userData,
+      remoteUser: user2DataValid,
       matchId,
       iceServers,
       mediaConstraints: CONFIG.MEDIA_CONSTRAINTS,
@@ -373,22 +448,34 @@ function attemptMatch(roomType = 'video') {
     };
     const matchedData2 = {
       peers: [user1.socketId, user2.socketId],
-      remoteUser: user1.userData,
+      remoteUser: user1DataValid,
       matchId,
       iceServers,
       mediaConstraints: CONFIG.MEDIA_CONSTRAINTS,
       matchedAt: Date.now(),
     };
 
-    Logger.info('attemptMatch', 'Sending matched events', {
-      user1: { socketId: user1.socketId, data: matchedData1 },
-      user2: { socketId: user2.socketId, data: matchedData2 },
+    Logger.info('attemptMatch', `Matched ${roomType} pair, storing in ${roomType === 'video' ? 'videoPairings' : 'chatPairings'}`, {
+      user1: { socketId: user1.socketId, userName: user1.userData?.userName },
+      user2: { socketId: user2.socketId, userName: user2.userData?.userName },
+      pairingsSize: pairings.size,
+    });
+
+    Logger.info('attemptMatch', 'Sending matched events to both peers', {
+      user1: user1.socketId,
+      user2: user2.socketId,
+      roomType,
     });
 
     io.to(user1.socketId).emit('matched', matchedData1);
     io.to(user2.socketId).emit('matched', matchedData2);
 
-    Logger.info('attemptMatch', `Successfully matched and notified ${roomType} pair`);
+    Logger.info('attemptMatch', `Successfully matched and notified ${roomType} pair, verifying pairings...`, {
+      user1InPairings: pairings.has(user1.socketId),
+      user2InPairings: pairings.has(user2.socketId),
+      pairingForUser1: pairings.get(user1.socketId) ? 'exists' : 'missing',
+      pairingForUser2: pairings.get(user2.socketId) ? 'exists' : 'missing',
+    });
     return true;
   } catch (error) {
     Logger.error('attemptMatch', 'Error during matching', error.message);
@@ -424,14 +511,13 @@ io.on('connection', (socket) => {
 
   socket.emit('SignallingClient', socket.id);
 
-  // User registration
+  // User registration - MINIMAL data only for socket identification
   socket.on('register_user', (userData, callback) => {
     try {
       const validation = validateUserData(userData);
 
       if (!validation.valid) {
         Logger.warn('register_user', `Validation failed: ${validation.error}`, { socketId: socket.id });
-        // ✅ IMPROVED: Better error response with error code
         const errorResponse = {
           success: false,
           error: {
@@ -444,8 +530,7 @@ io.on('connection', (socket) => {
         return;
       }
 
-      // Store complete user data including avatar info
-      // Normalize possible profile image keys from clients
+      // Extract profile image from multiple possible keys
       const profileImageCandidates = [
         'profileImagePath',
         'profile_image_path',
@@ -463,6 +548,7 @@ io.on('connection', (socket) => {
         }
       }
 
+      // Store MINIMAL socket metadata (only what's needed for real-time features)
       socketMetadata.set(socket.id, {
         userId: userData.userId,
         userName: userData.userName,
@@ -470,20 +556,29 @@ io.on('connection', (socket) => {
         avatarLetter: userData.avatarLetter || userData.userName[0].toUpperCase(),
         profileImagePath: profileImagePath || null,
         joinedAt: Date.now(),
+        // NOTE: Email, authType, isGuest are stored LOCALLY on phone
+        // Backend only keeps what's needed for video/chat identification
       });
 
       userSockets.set(userData.userId, socket.id);
+
+      // Simple logging - no sensitive data stored
       Logger.info('register_user', 'User registered', {
         socketId: socket.id,
         userId: userData.userId,
         userName: userData.userName,
       });
+
       broadcastStats();
-      if (typeof callback === 'function') callback({ success: true });
+      if (typeof callback === 'function') {
+        callback({ success: true });
+      }
     } catch (error) {
       Logger.error('register_user', 'Error registering user', error.message);
       socket.emit('error', { message: 'Registration failed' });
-      if (typeof callback === 'function') callback({ success: false, error: 'Registration failed' });
+      if (typeof callback === 'function') {
+        callback({ success: false, error: 'Registration failed' });
+      }
     }
   });
 
@@ -856,6 +951,30 @@ io.on('connection', (socket) => {
         return;
       }
 
+      // ✅ NEW: Check if already in queue to prevent duplicates
+      if (queue.some((item) => item.socketId === socket.id)) {
+        Logger.warn('find_partner', 'User already in queue', { socketId: socket.id, roomType });
+        socket.emit('queued', {
+          queuePosition: queue.findIndex((item) => item.socketId === socket.id) + 1,
+          type: roomType,
+        });
+        return;
+      }
+
+      // ✅ DEFENSIVE: Ensure userData exists before queueing
+      if (!userData) {
+        Logger.error('find_partner', 'userData not found for socket', {
+          socketId: socket.id,
+          hasMetadata: socketMetadata.has(socket.id),
+          metadataKeys: socketMetadata.get(socket.id) ? Object.keys(socketMetadata.get(socket.id)) : [],
+        });
+        socket.emit('error', {
+          code: 'NOT_REGISTERED',
+          message: 'Please register first via register_user',
+        });
+        return;
+      }
+
       const queuedUser = {
         socketId: socket.id,
         userData: userData,
@@ -867,6 +986,7 @@ io.on('connection', (socket) => {
       Logger.info('find_partner', 'User added to queue', {
         socketId: socket.id,
         roomType,
+        userDataKeys: Object.keys(userData),
         queuePosition: queue.length,
         queueSize: queue.length,
       });
@@ -998,17 +1118,37 @@ io.on('connection', (socket) => {
     try {
       const pairing = videoPairings.get(socket.id);
       const peerId = pairing?.peerId;
-      Logger.info('offer', 'Received offer from initiator', { socketId: socket.id, peerId, matchId: pairing?.matchId });
+      Logger.info('offer', '📤 Received offer from initiator', {
+        fromId: socket.id,
+        peerId,
+        matchId: pairing?.matchId,
+        hasPairingForSender: videoPairings.has(socket.id),
+        videoPairingSize: videoPairings.size,
+        offerSdpLength: data?.sdpOffer?.sdp?.length || 0,
+      });
       if (peerId && isValidSocketId(peerId)) {
-        Logger.info('offer', 'Forwarding offer to peer', { socketId: socket.id, peerId });
+        Logger.info('offer', '📤➡️ Forwarding offer to peer', {
+          fromId: socket.id,
+          toId: peerId,
+          hasPairingForReceiver: videoPairings.has(peerId),
+        });
         // Include sender id and matchId for easier routing/debugging on client
-        const out = Object.assign({}, data || {}, { fromId: socket.id, matchId: pairing?.matchId, forwardedAt: Date.now() });
+        const out = Object.assign({}, data || {}, {
+          fromId: socket.id,
+          matchId: pairing?.matchId,
+          forwardedAt: Date.now(),
+        });
         io.to(peerId).emit('makeCall', out);
       } else {
-        Logger.warn('offer', 'No valid peer found for offer', { socketId: socket.id, peerId });
+        Logger.warn('offer', '⚠️ No valid peer found for offer', {
+          fromId: socket.id,
+          peerId,
+          hasPairingForSender: videoPairings.has(socket.id),
+          videoPairingSize: videoPairings.size,
+        });
       }
     } catch (error) {
-      Logger.error('offer', 'Error sending offer', error.message);
+      Logger.error('offer', '❌ Error sending offer', error.message);
     }
   });
 
@@ -1017,16 +1157,36 @@ io.on('connection', (socket) => {
     try {
       const pairing = videoPairings.get(socket.id);
       const peerId = pairing?.peerId;
-      Logger.info('answer', 'Received answer from responder', { socketId: socket.id, peerId, matchId: pairing?.matchId });
+      Logger.info('answer', '📨 Received answer from responder', {
+        fromId: socket.id,
+        peerId,
+        matchId: pairing?.matchId,
+        hasPairingForSender: videoPairings.has(socket.id),
+        videoPairingSize: videoPairings.size,
+        answerSdpLength: data?.sdpAnswer?.sdp?.length || 0,
+      });
       if (peerId && isValidSocketId(peerId)) {
-        Logger.info('answer', 'Forwarding answer to peer', { socketId: socket.id, peerId });
-        const out = Object.assign({}, data || {}, { fromId: socket.id, matchId: pairing?.matchId, forwardedAt: Date.now() });
+        Logger.info('answer', '📨➡️ Forwarding answer to peer', {
+          fromId: socket.id,
+          toId: peerId,
+          hasPairingForReceiver: videoPairings.has(peerId),
+        });
+        const out = Object.assign({}, data || {}, {
+          fromId: socket.id,
+          matchId: pairing?.matchId,
+          forwardedAt: Date.now(),
+        });
         io.to(peerId).emit('callAnswered', out);
       } else {
-        Logger.warn('answer', 'No valid peer found for answer', { socketId: socket.id, peerId });
+        Logger.warn('answer', '⚠️ No valid peer found for answer', {
+          fromId: socket.id,
+          peerId,
+          hasPairingForSender: videoPairings.has(socket.id),
+          videoPairingSize: videoPairings.size,
+        });
       }
     } catch (error) {
-      Logger.error('answer', 'Error sending answer', error.message);
+      Logger.error('answer', '❌ Error sending answer', error.message);
     }
   });
 
@@ -1036,33 +1196,166 @@ io.on('connection', (socket) => {
       const pairing = videoPairings.get(socket.id);
       const peerId = pairing?.peerId;
       if (peerId && isValidSocketId(peerId)) {
-        Logger.info('IceCandidate', 'Forwarding ICE candidate', { socketId: socket.id, peerId, matchId: pairing?.matchId });
-        const out = Object.assign({}, data || {}, { fromId: socket.id, matchId: pairing?.matchId, forwardedAt: Date.now() });
+        Logger.info('IceCandidate', '❄️ Forwarding ICE candidate', {
+          fromId: socket.id,
+          toId: peerId,
+          matchId: pairing?.matchId,
+          candidate: data?.candidate?.substring(0, 50) || 'none',
+        });
+        const out = Object.assign({}, data || {}, {
+          fromId: socket.id,
+          matchId: pairing?.matchId,
+          forwardedAt: Date.now(),
+        });
         io.to(peerId).emit('IceCandidate', out);
+      } else {
+        Logger.warn('IceCandidate', '⚠️ No valid peer for ICE candidate', {
+          fromId: socket.id,
+          peerId,
+          hasPairingForSender: videoPairings.has(socket.id),
+        });
       }
     } catch (error) {
-      Logger.error('IceCandidate', 'Error sending ICE candidate', error.message);
+      Logger.error('IceCandidate', '❌ Error sending ICE candidate', error.message);
     }
   });
 
   // Chat message relay
   socket.on('message', (data) => {
     try {
-      if (!data || !data.message) {
-        Logger.warn('message', 'Empty message', { socketId: socket.id });
+      if (!data || (!data.message && !data.mediaUrl && !data.media && !data.mediaType)) {
+        Logger.warn('message', 'Empty message or media', { socketId: socket.id });
         return;
       }
 
       const peerId = chatPairings.get(socket.id)?.peerId;
       if (peerId && isValidSocketId(peerId)) {
-        io.to(peerId).emit('receiveMessage', {
-          message: String(data.message).substring(0, 500), // Limit message length
-          sender: socketMetadata.get(socket.id),
-          timestamp: Date.now(),
+        // Build payload allowing text and media (GIF / sticker / mp4)
+        // ✅ CRITICAL: Include ALL media fields for proper GIF/image delivery
+        const mediaUrl = data.mediaUrl || data.media || null;
+        const mediaType = data.mediaType || null;
+
+        // ✅ FIXED: Get sender metadata and fallback to message data if not in socketMetadata
+        const senderMeta = socketMetadata.get(socket.id) || {};
+        
+        // Use profile image from message if not in socketMetadata (fallback)
+        const profileImageFromMessage = data.profileImagePath || data.profile_image_path || data.profileImage || data.profile_pic || null;
+        const profileImage = senderMeta.profileImagePath || profileImageFromMessage || null;
+        
+        const senderWithProfileImage = Object.assign({}, senderMeta, {
+          // Use message-sent data as fallback if socketMetadata is incomplete
+          userName: senderMeta.userName || data.userName || 'Anonymous',
+          userId: senderMeta.userId || data.userId || socket.id,
+          avatarColor: senderMeta.avatarColor || data.avatarColor || '#128C7E',
+          avatarLetter: senderMeta.avatarLetter || data.avatarLetter || 'U',
+          // Include profile image in all possible field names for compatibility
+          profileImagePath: profileImage,
+          profile_image_path: profileImage,
+          profileImage: profileImage,
         });
+
+        const payload = {
+          message: data.message ? String(data.message).substring(0, 500) : null,
+          mediaUrl: mediaUrl,
+          mediaType: mediaType,
+          messageId: data.messageId || null,
+          sender: senderWithProfileImage,
+          timestamp: data.timestamp || Date.now(),
+        };
+
+        // ✅ NEW: Include reply metadata if message is a reply
+        if (data.replyTo && typeof data.replyTo === 'object') {
+          payload.replyTo = {
+            messageId: data.replyTo.messageId,
+            senderName: data.replyTo.senderName,
+            message: data.replyTo.message,
+            timestamp: data.replyTo.timestamp,
+          };
+        }
+
+        Logger.info('message', 'Relaying message to peer', {
+          from: socket.id,
+          to: peerId,
+          hasMessage: !!payload.message,
+          hasMediaUrl: !!mediaUrl,
+          mediaType: mediaType,
+          mediaUrlLength: mediaUrl ? mediaUrl.length : 0,
+          messageId: payload.messageId,
+          senderProfileImagePath: senderMeta.profileImagePath || 'MISSING',
+        });
+
+        io.to(peerId).emit('receiveMessage', payload);
+      } else {
+        Logger.warn('message', 'No valid peer found', { socketId: socket.id, hasChatPairing: chatPairings.has(socket.id) });
       }
     } catch (error) {
       Logger.error('message', 'Error relaying message', error.message);
+    }
+  });
+
+  // One-time star gift for peer or room
+  socket.on('gift_star', (data, callback) => {
+    try {
+      // Accept either { roomId } or { groupName } for group rooms, or empty for pair match-based gift
+      const roomId = data && data.roomId ? String(data.roomId) : null;
+      const groupName = data && data.groupName ? String(data.groupName) : null;
+      const pairing = chatPairings.get(socket.id) || videoPairings.get(socket.id);
+      const matchId = pairing && pairing.matchId ? pairing.matchId : null;
+
+      // Prefer explicit roomId, then groupName (if provided), else matchId
+      const key = roomId || groupName || matchId || null;
+      if (!key) {
+        if (callback) callback({ success: false, error: 'No valid target for gift' });
+        return;
+      }
+
+      const giftKey = `${socket.id}:${key}`;
+      if (oneTimeGifts.has(giftKey)) {
+        if (callback) callback({ success: false, error: 'Already gifted' });
+        return;
+      }
+
+      // Mark as gifted
+      oneTimeGifts.add(giftKey);
+      const prev = starCounts.get(key) || 0;
+      const next = prev + 1;
+      starCounts.set(key, next);
+
+      // Notify recipient(s)
+      if (matchId && pairing && pairing.peerId) {
+        const peerId = pairing.peerId;
+        io.to(peerId).emit('star_gifted', {
+          from: socketMetadata.get(socket.id),
+          to: socketMetadata.get(peerId),
+          matchId,
+          totalStars: next,
+          timestamp: Date.now(),
+        });
+        // also notify sender with confirmation
+        io.to(socket.id).emit('star_gifted_confirm', { totalStars: next, key, timestamp: Date.now() });
+      } else if (roomId || groupName) {
+        // Broadcast to room members (match by roomId or groupName)
+        const room = Array.from(rooms.values()).find(r => (roomId && (r.roomId === roomId || r.roomId === String(roomId))) || (groupName && r.roomName === groupName));
+        if (room) {
+          for (const memberId of room.memberIds) {
+            const memberSocketId = userSockets.get(memberId);
+            if (memberSocketId) {
+              io.to(memberSocketId).emit('star_gifted', {
+                from: socketMetadata.get(socket.id),
+                roomId: room.roomId,
+                totalStars: next,
+                timestamp: Date.now(),
+              });
+            }
+          }
+        }
+        io.to(socket.id).emit('star_gifted_confirm', { totalStars: next, key, timestamp: Date.now() });
+      }
+
+      if (callback) callback({ success: true, totalStars: next });
+    } catch (err) {
+      Logger.error('gift_star', 'Error processing star gift', err && err.message);
+      if (callback) callback({ success: false, error: 'Failed to gift star' });
     }
   });
 
@@ -1179,12 +1472,17 @@ io.on('connection', (socket) => {
       const groupName = data && data.groupName ? String(data.groupName).trim() : null;
       const message = data && data.message ? String(data.message).trim() : null;
       const clientMessageId = data && data.messageId ? String(data.messageId).trim() : null;
+      const mediaUrl = data && data.mediaUrl ? String(data.mediaUrl).trim() : null;
+      const mediaType = data && data.mediaType ? String(data.mediaType).trim() : null;
 
-      if (!groupName || !message) {
+      // ✅ FIXED: Allow message if groupName exists AND (text OR media) is present
+      if (!groupName || (!message && !mediaUrl)) {
         Logger.warn('send_group_message', 'Invalid message data', {
           socketId: socket.id,
           hasGroupName: !!groupName,
           hasMessage: !!message,
+          hasMedia: !!mediaUrl,
+          mediaType: mediaType || 'none',
         });
         if (callback) callback({ success: false, error: 'Invalid message data' });
         return;
@@ -1231,13 +1529,16 @@ io.on('connection', (socket) => {
         groupIcon: data?.groupIcon || '💬',
         userId: data?.userId || '',
         userName: (data?.userName || 'Unknown User').substring(0, 50),
-        text: message.substring(0, 1000), // Increased limit and fixed field name
-        message: message.substring(0, 1000), // Keep both for compatibility
+        text: message ? message.substring(0, 1000) : '', // Empty string if only media
+        message: message ? message.substring(0, 1000) : '', // Keep both for compatibility
+        mediaUrl: mediaUrl || null, // ✅ ADD: Include media URL for GIFs
+        mediaType: mediaType || null, // ✅ ADD: Include media type (gif, image, video, etc)
         avatarColor: data?.avatarColor || '#128C7E',
         avatarLetter: (data?.avatarLetter || (data?.userName ? data.userName.charAt(0).toUpperCase() : 'U')).substring(0, 1),
         timestamp: Date.now(), // Use numeric timestamp
         messageId: serverMessageId,
         isOwn: false, // Backend doesn't know, frontend will determine
+        isMediaOnly: !message && mediaUrl, // ✅ ADD: Flag for media-only messages
       };
 
       Logger.info('send_group_message', 'Broadcasting message to others (not sender)', {
