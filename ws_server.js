@@ -124,6 +124,8 @@ app.post('/auth/validate-token', async (req, res) => {
       details: err && err.message,
     });
   }
+
+  
 });
 
 // ========== CONFIGURATION ==========
@@ -215,6 +217,128 @@ const rateLimitMap = new Map(); // socketId -> { count, resetTime } for abuse pr
 // Star gifting state: counts per room or match and one-time gift tracking
 const starCounts = new Map(); // key -> number (roomId or matchId)
 const oneTimeGifts = new Set(); // `${socketId}:${key}` to prevent duplicate gifts
+
+// ========== REPORTING & BLOCKING SYSTEM ==========
+const reportedUsers = new Map(); // userId -> { reports: { reporterId: timestamp }, blockedUntil: timestamp }
+const REPORT_CONFIG = {
+  reportWindowMs: 24 * 60 * 60 * 1000,    // 24 hours
+  
+  // Progressive blocking (matching frontend implementation)
+  blockDuration_1report_Ms: 10 * 60 * 1000,      // 10 minutes
+  blockDuration_3reports_Ms: 3 * 60 * 60 * 1000, // 3 hours
+  blockDuration_5reports_Ms: 24 * 60 * 60 * 1000, // 1 day (24 hours)
+};
+
+// Clean and check if a user is blocked
+function isUserBlocked(userId) {
+  if (!reportedUsers.has(userId)) return false;
+  const entry = reportedUsers.get(userId);
+  const now = Date.now();
+  
+  // Check if block has expired
+  if (entry.blockedUntil && entry.blockedUntil > now) {
+    return true;
+  }
+  
+  // Clean expired block
+  if (entry.blockedUntil && entry.blockedUntil <= now) {
+    entry.blockedUntil = null;
+  }
+  
+  // Clean old reports (outside 24h window)
+  let hasChanges = false;
+  if (entry.reports) {
+    const cutoff = now - REPORT_CONFIG.reportWindowMs;
+    const reporterIds = Object.keys(entry.reports);
+    for (const reporterId of reporterIds) {
+      if (entry.reports[reporterId] < cutoff) {
+        delete entry.reports[reporterId];
+        hasChanges = true;
+      }
+    }
+  }
+  
+  // Remove entry if empty
+  if ((!entry.reports || Object.keys(entry.reports).length === 0) && !entry.blockedUntil) {
+    reportedUsers.delete(userId);
+    return false;
+  }
+  
+  // 🔒 CRITICAL FIX: Save changes back to the Map
+  if (hasChanges) {
+    reportedUsers.set(userId, entry);
+  }
+  
+  return false;
+}
+
+// Process a report from a reporter
+function recordReport(reportedUserId, reporterId) {
+  Logger.info('recordReport', 'CALLED', { reportedUserId, reporterId });
+  
+  if (!reportedUserId || !reporterId) {
+    Logger.warn('recordReport', 'Invalid inputs', { reportedUserId, reporterId });
+    return false;
+  }
+  
+  const now = Date.now();
+  let entry = reportedUsers.get(reportedUserId) || { reports: {}, blockedUntil: null };
+  
+  Logger.info('recordReport', 'Retrieved entry', { reportedUserId, existingReports: Object.keys(entry.reports || {}).length, blockedUntil: entry.blockedUntil });
+  
+  // Clean old reports
+  const cutoff = now - REPORT_CONFIG.reportWindowMs;
+  const reporterIds = Object.keys(entry.reports || {});
+  Logger.info('recordReport', 'Cleaning old reports', { reporterIds: reporterIds.length, cutoff });
+  
+  for (const rId of reporterIds) {
+    const reportTimestamp = entry.reports[rId];
+    Logger.info('recordReport', 'Checking report age', { reporter: rId, timestamp: reportTimestamp, cutoff, isOld: reportTimestamp < cutoff });
+    
+    if ((entry.reports[rId] || 0) < cutoff) {
+      delete entry.reports[rId];
+      Logger.info('recordReport', 'Deleted old report', { reporter: rId });
+    }
+  }
+  
+  if (!entry.reports) entry.reports = {};
+  entry.reports[reporterId] = now;
+  Logger.info('recordReport', 'Added new report', { reporter: reporterId, timestamp: now });
+  
+  // Progressive blocking based on unique reporter count
+  const uniqueReporters = Object.keys(entry.reports).length;
+  Logger.info('recordReport', 'Unique reporter count', { reportedUserId, count: uniqueReporters });
+  
+  let blockDuration = 0;
+  let blockReason = '';
+  
+  if (uniqueReporters >= 5) {
+    blockDuration = REPORT_CONFIG.blockDuration_5reports_Ms;
+    blockReason = '5 reports - 1 day block';
+  } else if (uniqueReporters >= 3) {
+    blockDuration = REPORT_CONFIG.blockDuration_3reports_Ms;
+    blockReason = '3 reports - 3 hour block';
+  } else if (uniqueReporters >= 1) {
+    blockDuration = REPORT_CONFIG.blockDuration_1report_Ms;
+    blockReason = '1 report - 10 minute block';
+  }
+  
+  if (blockDuration > 0) {
+    entry.blockedUntil = now + blockDuration;
+    Logger.warn('reportReport', `User ${reportedUserId} blocked: ${blockReason}`, { 
+      reportedUserId, 
+      uniqueReporters,
+      reporters: Object.keys(entry.reports),
+      blockedUntil: entry.blockedUntil,
+      blockReason
+    });
+  }
+  
+  reportedUsers.set(reportedUserId, entry);
+  Logger.info('recordReport', 'Saved entry', { reportedUserId, finalReportCount: Object.keys(entry.reports).length, blockedUntil: entry.blockedUntil });
+  
+  return true;
+}
 
 // ========== RATE LIMITING ==========
 const RATE_LIMIT_CONFIG = {
@@ -379,6 +503,22 @@ function attemptMatch(roomType = 'video') {
 
     if (!isValidSocketId(user1?.socketId) || !isValidSocketId(user2?.socketId)) {
       Logger.warn('attemptMatch', 'Invalid socket IDs in queue');
+      return false;
+    }
+    
+    // 🔒 CRITICAL FIX: Check if either user is blocked due to reports
+    const user1Blocked = user1.userData && user1.userData.userId && isUserBlocked(user1.userData.userId);
+    const user2Blocked = user2.userData && user2.userData.userId && isUserBlocked(user2.userData.userId);
+    
+    if (user1Blocked) {
+      Logger.warn('attemptMatch', 'User1 is blocked, requeuing User2', { user1Id: user1.socketId, user2Id: user2.socketId });
+      queue.push(user2);
+      return false;
+    }
+    
+    if (user2Blocked) {
+      Logger.warn('attemptMatch', 'User2 is blocked, requeuing User1', { user1Id: user1.socketId, user2Id: user2.socketId });
+      queue.push(user1);
       return false;
     }
 
@@ -905,6 +1045,55 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ✅ NEW: Report a user
+  socket.on('report_user', (data, callback) => {
+    try {
+      Logger.info('report_user', 'RECEIVED report_user event', { data });
+      
+      const reportedUserId = (data && data.reportedUserId) || (data && data.userId);
+      const reporterId = (data && data.reporterId);
+      const reason = (data && data.reason) || 'Unspecified';
+      
+      Logger.info('report_user', 'Parsed data', { reportedUserId, reporterId, reason });
+      
+      if (!reportedUserId || !reporterId) {
+        Logger.warn('report_user', 'Missing reportedUserId or reporterId', { data });
+        if (callback) callback({ success: false, error: 'Missing required fields' });
+        return;
+      }
+      
+      // Prevent self-reporting
+      if (reportedUserId === reporterId) {
+        Logger.warn('report_user', 'User attempted self-report', { userId: reportedUserId });
+        if (callback) callback({ success: false, error: 'Cannot report yourself' });
+        return;
+      }
+      
+      const result = recordReport(reportedUserId, reporterId);
+      Logger.info('report_user', `User ${reportedUserId} reported by ${reporterId}`, { reported: reportedUserId, reporter: reporterId, recordResult: result });
+      
+      // Send notification to the reported user if they're online
+      const reportedUserSocketId = userSockets.get(reportedUserId);
+      Logger.info('report_user', `Looking up online status for ${reportedUserId}`, { socketId: reportedUserSocketId, allOnlineUsers: Array.from(userSockets.keys()).length });
+      
+      if (reportedUserSocketId) {
+        io.to(reportedUserSocketId).emit('report_notification', {
+          reporterId: reporterId,
+          reason: reason,
+          timestamp: Date.now(),
+        });
+        Logger.info('report_user', `Notification sent to ${reportedUserId}`, { socketId: reportedUserSocketId });
+      } else {
+        Logger.info('report_user', `User ${reportedUserId} not online, notification queued for when they return`, { reportedUserId });
+      }
+      
+      if (callback) callback({ success: true });
+    } catch (error) {
+      Logger.error('report_user', 'Error recording report', error.message);
+      if (callback) callback({ success: false, error: 'Failed to record report' });
+    }
+  });
+
   // Find partner for video/chat
   socket.on('find_partner', (data) => {
     try {
@@ -931,12 +1120,44 @@ io.on('connection', (socket) => {
 
       if (!isValidSocketId(socket.id)) {
         Logger.warn('find_partner', 'Invalid socket ID', { socketId: socket.id });
-        // ✅ IMPROVED: Clear error with code
         socket.emit('error', {
           code: 'INVALID_SOCKET',
           message: 'Invalid or missing socket ID. Please reconnect.',
         });
         return;
+      }
+
+      // ✅ NEW: Check if user is blocked by reports
+      if (userData && userData.userId) {
+        if (isUserBlocked(userData.userId)) {
+          Logger.warn('find_partner', 'Blocked user attempted to find partner', { userId: userData.userId, userName: userData.userName });
+          
+          // Get remaining block time with actual duration
+          let remainingMs = 0;
+          const entry = reportedUsers.get(userData.userId);
+          if (entry && entry.blockedUntil) {
+            remainingMs = Math.max(0, entry.blockedUntil - Date.now());
+          }
+          
+          const remainingSeconds = Math.ceil(remainingMs / 1000);
+          const hours = Math.floor(remainingSeconds / 3600);
+          const minutes = Math.floor((remainingSeconds % 3600) / 60);
+          
+          let timeStr = '';
+          if (hours > 0) {
+            timeStr = `${hours}h ${minutes}m`;
+          } else {
+            timeStr = `${minutes}m`;
+          }
+          
+          socket.emit('error', {
+            code: 'USER_BLOCKED',
+            message: `You are blocked from pairing. Blocked for ${timeStr}.`,
+            remainingSeconds: remainingSeconds,
+            blockedUntil: entry?.blockedUntil,
+          });
+          return;
+        }
       }
 
       const queue = roomType === 'chat' ? chatQueue : videoQueue;
@@ -1524,17 +1745,21 @@ io.on('connection', (socket) => {
       cache.ids.add(serverMessageId);
       cache.timestamp = Date.now();
 
+      // ✅ CRITICAL FIX: Get sender's ACTUAL profile from server (not trusting client data)
+      const senderMeta = socketMetadata.get(socket.id) || {};
+
       const messageData = {
         groupName,
         groupIcon: data?.groupIcon || '💬',
-        userId: data?.userId || '',
-        userName: (data?.userName || 'Unknown User').substring(0, 50),
+        userId: senderMeta.userId || data?.userId || '',
+        userName: (senderMeta.userName || data?.userName || 'Unknown User').substring(0, 50),
         text: message ? message.substring(0, 1000) : '', // Empty string if only media
         message: message ? message.substring(0, 1000) : '', // Keep both for compatibility
         mediaUrl: mediaUrl || null, // ✅ ADD: Include media URL for GIFs
         mediaType: mediaType || null, // ✅ ADD: Include media type (gif, image, video, etc)
-        avatarColor: data?.avatarColor || '#128C7E',
-        avatarLetter: (data?.avatarLetter || (data?.userName ? data.userName.charAt(0).toUpperCase() : 'U')).substring(0, 1),
+        senderProfileImagePath: senderMeta.profileImagePath || null, // ✅ CRITICAL: Include sender's actual profile image
+        avatarColor: senderMeta.avatarColor || data?.avatarColor || '#128C7E',
+        avatarLetter: (senderMeta.avatarLetter || data?.avatarLetter || (senderMeta.userName ? senderMeta.userName.charAt(0).toUpperCase() : 'U')).substring(0, 1),
         timestamp: Date.now(), // Use numeric timestamp
         messageId: serverMessageId,
         isOwn: false, // Backend doesn't know, frontend will determine
