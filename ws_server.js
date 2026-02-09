@@ -1669,6 +1669,20 @@ io.on('connection', (socket) => {
       roomSet.add(socket.id);
       socket.join(`group_${groupName}`);
 
+      // Persist any profile image provided by the client when joining so the server
+      // can use it for later group messages (helps when clients send data: URIs).
+      try {
+        const meta = socketMetadata.get(socket.id) || {};
+        const incomingProfile = data?.profileImagePath || data?.senderProfileImagePath || data?.profile_image_path || data?.profileImage || data?.profile_pic || data?.photo || data?.avatarUrl || data?.img || null;
+        if (incomingProfile) {
+          meta.profileImagePath = incomingProfile;
+          socketMetadata.set(socket.id, meta);
+          Logger.info('join_group', 'Persisted incoming profileImagePath from join_group', { socketId: socket.id, preview: String(incomingProfile).substring(0, 64) });
+        }
+      } catch (err) {
+        Logger.warn('join_group', 'Failed to persist incoming profile image to socketMetadata', { socketId: socket.id, err: err && err.message });
+      }
+
       const memberCount = roomSet.size;
 
       Logger.info('join_group', 'User joined group', {
@@ -1775,7 +1789,11 @@ io.on('connection', (socket) => {
         message: message ? message.substring(0, 1000) : '', // Keep both for compatibility
         mediaUrl: mediaUrl || null, // ✅ ADD: Include media URL for GIFs
         mediaType: mediaType || null, // ✅ ADD: Include media type (gif, image, video, etc)
-        senderProfileImagePath: senderMeta.profileImagePath || null, // ✅ CRITICAL: Include sender's actual profile image
+        // Prefer server-stored profile image (set at registration or join),
+        // but if missing fall back to client-sent fields so data: URIs are relayed.
+        senderProfileImagePath: senderMeta.profileImagePath || data?.senderProfileImagePath || data?.profileImagePath || data?.profile_image_path || null,
+        // Also include the generic `profileImagePath` key for clients that read that field
+        profileImagePath: senderMeta.profileImagePath || data?.profileImagePath || data?.senderProfileImagePath || data?.profile_image_path || null,
         avatarColor: senderMeta.avatarColor || data?.avatarColor || '#128C7E',
         avatarLetter: (senderMeta.avatarLetter || data?.avatarLetter || (senderMeta.userName ? senderMeta.userName.charAt(0).toUpperCase() : 'U')).substring(0, 1),
         timestamp: Date.now(), // Use numeric timestamp
