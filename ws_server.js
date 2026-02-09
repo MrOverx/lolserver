@@ -561,16 +561,34 @@ function attemptMatch(roomType = 'video') {
     const user1DataValid = ensureUserData(user1.userData, user1.socketId);
     const user2DataValid = ensureUserData(user2.userData, user2.socketId);
 
-    // Create pairing with validated user data
+    // Normalize outgoing user object to guarantee profile image keys the frontend expects
+    const normalizeOutgoingUser = (ud) => {
+      const profileImage = ud && (ud.profileImagePath || ud.profile_image_path || ud.profileImage || ud.profile_pic || ud.photo) ? (ud.profileImagePath || ud.profile_image_path || ud.profileImage || ud.profile_pic || ud.photo) : null;
+      return {
+        userId: ud.userId || null,
+        userName: ud.userName || 'Unknown',
+        avatarColor: ud.avatarColor || '#128C7E',
+        avatarLetter: (ud.avatarLetter || (ud.userName ? ud.userName.charAt(0).toUpperCase() : 'U')).substring(0,1),
+        // Provide multiple variants so different clients can read whichever key they expect
+        profileImagePath: profileImage,
+        profile_image_path: profileImage,
+        profileImage: profileImage,
+      };
+    };
+
+    const user1Out = normalizeOutgoingUser(user1DataValid);
+    const user2Out = normalizeOutgoingUser(user2DataValid);
+
+    // Create pairing with validated (normalized) user data
     const matchId = generateMatchId();
     pairings.set(user1.socketId, {
       peerId: user2.socketId,
-      userData: user2DataValid,
+      userData: user2Out,
       matchId,
     });
     pairings.set(user2.socketId, {
       peerId: user1.socketId,
-      userData: user1DataValid,
+      userData: user1Out,
       matchId,
     });
     socketQueues.delete(user1.socketId);
@@ -580,7 +598,7 @@ function attemptMatch(roomType = 'video') {
     const iceServers = buildIceServers();
     const matchedData1 = {
       peers: [user1.socketId, user2.socketId],
-      remoteUser: user2DataValid,
+      remoteUser: user2Out,
       matchId,
       iceServers,
       mediaConstraints: CONFIG.MEDIA_CONSTRAINTS,
@@ -588,7 +606,7 @@ function attemptMatch(roomType = 'video') {
     };
     const matchedData2 = {
       peers: [user1.socketId, user2.socketId],
-      remoteUser: user1DataValid,
+      remoteUser: user1Out,
       matchId,
       iceServers,
       mediaConstraints: CONFIG.MEDIA_CONSTRAINTS,
