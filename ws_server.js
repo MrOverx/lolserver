@@ -1502,13 +1502,18 @@ io.on('connection', (socket) => {
           timestamp: data.timestamp || Date.now(),
         };
 
-        // ✅ NEW: Include reply metadata if message is a reply
+        // ✅ NEW: Include reply metadata if message is a reply (preserve media fields)
         if (data.replyTo && typeof data.replyTo === 'object') {
           payload.replyTo = {
-            messageId: data.replyTo.messageId,
-            senderName: data.replyTo.senderName,
-            message: data.replyTo.message,
-            timestamp: data.replyTo.timestamp,
+            messageId: data.replyTo.messageId || null,
+            senderName: data.replyTo.senderName || data.replyTo.userName || null,
+            message: data.replyTo.message || null,
+            timestamp: data.replyTo.timestamp || null,
+            // Preserve any media reference present on the replied-to message
+            mediaUrl: data.replyTo.mediaUrl || data.replyTo.media || data.replyTo.media_url || null,
+            mediaType: data.replyTo.mediaType || null,
+            // Preserve profile image if client included it in the replied message
+            senderProfileImagePath: data.replyTo.senderProfileImagePath || data.replyTo.profileImagePath || data.replyTo.profile_image_path || null,
           };
         }
 
@@ -1801,6 +1806,19 @@ io.on('connection', (socket) => {
         isOwn: false, // Backend doesn't know, frontend will determine
         isMediaOnly: !message && mediaUrl, // ✅ ADD: Flag for media-only messages
       };
+
+      // If the client included reply metadata, preserve and forward it (including media)
+      if (data.replyTo && typeof data.replyTo === 'object') {
+        messageData.replyTo = {
+          messageId: data.replyTo.messageId || null,
+          userName: data.replyTo.userName || data.replyTo.senderName || null,
+          message: data.replyTo.message || null,
+          timestamp: data.replyTo.timestamp || null,
+          mediaUrl: data.replyTo.mediaUrl || data.replyTo.media || data.replyTo.media_url || null,
+          mediaType: data.replyTo.mediaType || null,
+          senderProfileImagePath: data.replyTo.senderProfileImagePath || data.replyTo.profileImagePath || data.replyTo.profile_image_path || null,
+        };
+      }
 
       Logger.info('send_group_message', 'Broadcasting message to others (not sender)', {
         socketId: socket.id,
