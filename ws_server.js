@@ -229,6 +229,9 @@ const REPORT_CONFIG = {
   blockDuration_5reports_Ms: 24 * 60 * 60 * 1000, // 1 day (24 hours)
 };
 
+// ========== GENDER FILTER SYSTEM ==========
+const userGenderPreferences = new Map(); // userId -> 'male'|'female'|'other'|'all'
+
 // Clean and check if a user is blocked
 function isUserBlocked(userId) {
   if (!reportedUsers.has(userId)) return false;
@@ -423,6 +426,33 @@ function isValidSocketId(socketId) {
   return typeof socketId === 'string' && socketId.length > 0;
 }
 
+// ✅ Helper function to sanitize nested reply chains (reply to a reply)
+function _sanitizeNestedReply(replyData) {
+  if (!replyData || typeof replyData !== 'object') return null;
+  
+  const replyUserName = (replyData.userName || replyData.senderName || '').trim();
+  const finalReplyUserName = replyUserName || replyData.userId || 'Unknown User';
+  
+  const sanitized = {
+    messageId: replyData.messageId || null,
+    userName: finalReplyUserName.substring(0, 50),
+    message: replyData.message || null,
+    timestamp: replyData.timestamp || null,
+    mediaUrl: replyData.mediaUrl || replyData.media || replyData.media_url || null,
+    mediaType: replyData.mediaType || null,
+    senderProfileImagePath: replyData.senderProfileImagePath || replyData.profileImagePath || replyData.profile_image_path || null,
+    avatarColor: replyData.avatarColor || '#128C7E',
+    avatarLetter: ((replyData.avatarLetter || finalReplyUserName.charAt(0).toUpperCase() || 'U').substring(0, 1)),
+  };
+  
+  // ✅ Recursively handle deeper nested replies
+  if (replyData.replyTo && typeof replyData.replyTo === 'object') {
+    sanitized.replyTo = _sanitizeNestedReply(replyData.replyTo);
+  }
+  
+  return sanitized;
+}
+
 // ========== ROOM MANAGEMENT ==========
 
 function decomposeRoom(socketId, roomType = 'video') {
@@ -560,6 +590,48 @@ function attemptMatch(roomType = 'video') {
 
     const user1DataValid = ensureUserData(user1.userData, user1.socketId);
     const user2DataValid = ensureUserData(user2.userData, user2.socketId);
+
+    // ✅ NEW: Check gender compatibility AFTER data validation
+    const user1Gender = userGenderPreferences.get(user1DataValid.userId) || 'all';
+    const user2Gender = userGenderPreferences.get(user2DataValid.userId) || 'all';
+    const user1UserGender = user1DataValid.gender || 'other';
+    const user2UserGender = user2DataValid.gender || 'other';
+
+    Logger.info('attemptMatch', 'Gender compatibility check', {
+      user1Id: user1.socketId,
+      user1PreferredGender: user1Gender,
+      user1ActualGender: user1UserGender,
+      user2Id: user2.socketId,
+      user2PreferredGender: user2Gender,
+      user2ActualGender: user2UserGender,
+    });
+
+    // Check if user1's gender preference matches user2's gender
+    if (user1Gender !== 'all' && user1Gender !== user2UserGender) {
+      Logger.warn('attemptMatch', 'Gender mismatch - user1 preference incompatible', {
+        user1Gender: user1Gender,
+        user2ActualGender: user2UserGender,
+        action: 'requeue_user2',
+      });
+      queue.push(user2);
+      return false;
+    }
+
+    // Check if user2's gender preference matches user1's gender
+    if (user2Gender !== 'all' && user2Gender !== user1UserGender) {
+      Logger.warn('attemptMatch', 'Gender mismatch - user2 preference incompatible', {
+        user2Gender: user2Gender,
+        user1ActualGender: user1UserGender,
+        action: 'requeue_user1',
+      });
+      queue.push(user1);
+      return false;
+    }
+
+    Logger.info('attemptMatch', 'Gender compatibility passed - proceeding with match', {
+      user1: user1DataValid.userId,
+      user2: user2DataValid.userId,
+    });
 
     // Normalize outgoing user object to guarantee profile image keys the frontend expects
     const normalizeOutgoingUser = (ud) => {
@@ -1112,6 +1184,39 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ✅ NEW: Handle gender filter preference from frontend
+  socket.on('set_gender_preference', (data, callback) => {
+    try {
+      const socketMeta = socketMetadata.get(socket.id);
+      if (!socketMeta || !socketMeta.userId) {
+        Logger.warn('gender_preference', 'Invalid user metadata', { socketId: socket.id });
+        if (callback) callback({ success: false, error: 'Invalid user' });
+        return;
+      }
+
+      const { gender } = data;
+      const validGenders = ['male', 'female', 'other', 'all'];
+      
+      if (!gender || !validGenders.includes(gender)) {
+        Logger.warn('gender_preference', 'Invalid gender value', { gender, socketId: socket.id });
+        if (callback) callback({ success: false, error: 'Invalid gender value' });
+        return;
+      }
+
+      userGenderPreferences.set(socketMeta.userId, gender);
+      Logger.info('gender_preference', 'Gender filter set successfully', { 
+        userId: socketMeta.userId, 
+        gender,
+        socketId: socket.id
+      });
+      
+      if (callback) callback({ success: true });
+    } catch (error) {
+      Logger.error('gender_preference', 'Error setting gender preference', error.message);
+      if (callback) callback({ success: false, error: error.message });
+    }
+  });
+
   // Find partner for video/chat
   socket.on('find_partner', (data) => {
     try {
@@ -1504,16 +1609,22 @@ io.on('connection', (socket) => {
 
         // ✅ NEW: Include reply metadata if message is a reply (preserve media fields)
         if (data.replyTo && typeof data.replyTo === 'object') {
+          const replyUserName = (data.replyTo.userName || data.replyTo.senderName || '').trim();
+          const finalReplyUserName = replyUserName || data.replyTo.userId || 'Unknown User';
+          
           payload.replyTo = {
             messageId: data.replyTo.messageId || null,
-            senderName: data.replyTo.senderName || data.replyTo.userName || null,
+            userName: finalReplyUserName.substring(0, 50),
             message: data.replyTo.message || null,
             timestamp: data.replyTo.timestamp || null,
-            // Preserve any media reference present on the replied-to message
             mediaUrl: data.replyTo.mediaUrl || data.replyTo.media || data.replyTo.media_url || null,
             mediaType: data.replyTo.mediaType || null,
-            // Preserve profile image if client included it in the replied message
             senderProfileImagePath: data.replyTo.senderProfileImagePath || data.replyTo.profileImagePath || data.replyTo.profile_image_path || null,
+            avatarColor: data.replyTo.avatarColor || '#128C7E',
+            avatarLetter: ((data.replyTo.avatarLetter || finalReplyUserName.charAt(0).toUpperCase() || 'U').substring(0, 1)),
+            replyTo: data.replyTo.replyTo && typeof data.replyTo.replyTo === 'object'
+              ? _sanitizeNestedReply(data.replyTo.replyTo)
+              : null,
           };
         }
 
@@ -1525,9 +1636,11 @@ io.on('connection', (socket) => {
           mediaType: mediaType,
           mediaUrlLength: mediaUrl ? mediaUrl.length : 0,
           messageId: payload.messageId,
+          hasReply: !!payload.replyTo,
           senderProfileImagePath: senderMeta.profileImagePath || 'MISSING',
         });
 
+        // Send to peer
         io.to(peerId).emit('receiveMessage', payload);
       } else {
         Logger.warn('message', 'No valid peer found', { socketId: socket.id, hasChatPairing: chatPairings.has(socket.id) });
@@ -1626,6 +1739,8 @@ io.on('connection', (socket) => {
       const userData = socketMetadata.get(socket.id);
       if (userData) {
         userSockets.delete(userData.userId);
+        // ✅ NEW: Clean gender preference on disconnect
+        userGenderPreferences.delete(userData.userId);
       }
       socketMetadata.delete(socket.id);
       socketQueues.delete(socket.id);
@@ -1786,37 +1901,37 @@ io.on('connection', (socket) => {
       const senderMeta = socketMetadata.get(socket.id) || {};
 
       const messageData = {
-        groupName,
-        groupIcon: data?.groupIcon || '💬',
         userId: senderMeta.userId || data?.userId || '',
         userName: (senderMeta.userName || data?.userName || 'Unknown User').substring(0, 50),
-        text: message ? message.substring(0, 1000) : '', // Empty string if only media
-        message: message ? message.substring(0, 1000) : '', // Keep both for compatibility
-        mediaUrl: mediaUrl || null, // ✅ ADD: Include media URL for GIFs
-        mediaType: mediaType || null, // ✅ ADD: Include media type (gif, image, video, etc)
-        // Prefer server-stored profile image (set at registration or join),
-        // but if missing fall back to client-sent fields so data: URIs are relayed.
+        message: message ? message.substring(0, 1000) : null,
+        mediaUrl: mediaUrl || null,
+        mediaType: mediaType || null,
         senderProfileImagePath: senderMeta.profileImagePath || data?.senderProfileImagePath || data?.profileImagePath || data?.profile_image_path || null,
-        // Also include the generic `profileImagePath` key for clients that read that field
         profileImagePath: senderMeta.profileImagePath || data?.profileImagePath || data?.senderProfileImagePath || data?.profile_image_path || null,
         avatarColor: senderMeta.avatarColor || data?.avatarColor || '#128C7E',
         avatarLetter: (senderMeta.avatarLetter || data?.avatarLetter || (senderMeta.userName ? senderMeta.userName.charAt(0).toUpperCase() : 'U')).substring(0, 1),
-        timestamp: Date.now(), // Use numeric timestamp
+        timestamp: Date.now(),
         messageId: serverMessageId,
-        isOwn: false, // Backend doesn't know, frontend will determine
-        isMediaOnly: !message && mediaUrl, // ✅ ADD: Flag for media-only messages
       };
 
       // If the client included reply metadata, preserve and forward it (including media)
       if (data.replyTo && typeof data.replyTo === 'object') {
+        const replyUserName = (data.replyTo.userName || data.replyTo.senderName || '').trim();
+        const finalReplyUserName = replyUserName || data.replyTo.userId || 'Unknown User';
+        
         messageData.replyTo = {
           messageId: data.replyTo.messageId || null,
-          userName: data.replyTo.userName || data.replyTo.senderName || null,
+          userName: finalReplyUserName.substring(0, 50),
           message: data.replyTo.message || null,
           timestamp: data.replyTo.timestamp || null,
           mediaUrl: data.replyTo.mediaUrl || data.replyTo.media || data.replyTo.media_url || null,
           mediaType: data.replyTo.mediaType || null,
           senderProfileImagePath: data.replyTo.senderProfileImagePath || data.replyTo.profileImagePath || data.replyTo.profile_image_path || null,
+          avatarColor: data.replyTo.avatarColor || '#128C7E',
+          avatarLetter: ((data.replyTo.avatarLetter || finalReplyUserName.charAt(0).toUpperCase() || 'U').substring(0, 1)),
+          replyTo: data.replyTo.replyTo && typeof data.replyTo.replyTo === 'object'
+            ? _sanitizeNestedReply(data.replyTo.replyTo)
+            : null,
         };
       }
 
