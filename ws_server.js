@@ -1,9 +1,111 @@
+require('dotenv').config(); // Load environment variables from .env file
 const express = require('express');
 const http = require('http');
 const socketIO = require('socket.io');
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+
+// ✅ Import optimization utilities
+const { Logger } = require('./utils/logger');
+const { sendError, sendSuccess, serializeUser, serializeMinimalUser } = require('./utils/responseHandler');
+const { autoRegisterUserIfNeeded, validateUserData } = require('./utils/userRegistration');
+
+// ✅ Import enhancement middleware
+const { validateAuth, validateRegistration, validateProfileUpdate } = require('./middleware/validation');
+const { globalRateLimit, createRateLimiter, startCleanupInterval } = require('./middleware/rateLimiter');
+const { errorHandler, notFoundHandler, asyncHandler } = require('./middleware/errorHandler');
+
+// ✅ Import enhancement utilities
+const cache = require('./utils/cache');
+const { CACHE_TTL } = require('./utils/cache');
+const health = require('./utils/health');
 
 const app = express();
 const server = http.createServer(app);
+
+// ✅ Add JSON parsing middleware
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// ✅ Register global middleware (BEFORE routes)
+app.use(globalRateLimit);
+
+// ✅ Health check endpoint
+app.get('/health', health.handleHealthCheck);
+
+// ✅ Register database health check
+health.registerService('database', async () => {
+  try {
+    await mongoose.connection.db.admin().ping();
+    return { status: 'healthy', message: 'MongoDB connected' };
+  } catch (err) {
+    return { status: 'unhealthy', message: err.message };
+  }
+});
+
+// ✅ Start health monitoring
+health.startMonitoring(60);
+
+// ✅ Start rate limit cleanup
+startCleanupInterval();
+
+// ========== MONGODB CONNECTION CONSTANTS ==========
+// 🔐 MongoDB Atlas Connection String (from environment variable)
+// Format: mongodb+srv://username:password@cluster.mongodb.net/?appName=databaseName
+const MONGODB_CONFIG = {
+  // Primary connection URI from environment or fallback to lolcluster
+  URI: process.env.MONGODB_URI || 'mongodb+srv://overx:ankit5639@lolcluster.68fu58k.mongodb.net/?appName=lolcluster',
+  
+  // Connection options for optimal performance and frontend compatibility
+  options: {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+    // Connection pooling for better performance
+    maxPoolSize: 10,
+    minPoolSize: 2,
+    // Timeouts
+    socketTimeoutMS: 45000,
+    serverSelectionTimeoutMS: 5000,
+    connectTimeoutMS: 10000,
+    // Retries
+    retryWrites: true,
+    retryReads: true,
+    // Write concern for data reliability
+    writeConcern: { w: 'majority' },
+  },
+};
+
+// ========== MONGODB CONNECTION ==========
+console.log('🔄 Connecting to MongoDB...');
+console.log(`📍 Database: ${MONGODB_CONFIG.URI.split('/').pop()}`);
+
+mongoose.connect(MONGODB_CONFIG.URI, MONGODB_CONFIG.options)
+  .then(() => {
+    console.log('✅ Connected to MongoDB Atlas Successfully!');
+    Logger.info('mongodb', '✅ Connected to MongoDB Atlas', {
+      database: MONGODB_CONFIG.URI.split('/').pop(),
+      timestamp: new Date().toISOString(),
+    });
+  })
+  .catch(err => {
+    console.error('❌ MongoDB connection error:', err.message);
+    Logger.error('mongodb', '❌ MongoDB connection error', err.message);
+    // Don't exit - allow server to start and attempt reconnection
+    setTimeout(() => {
+      console.log('🔄 Attempting MongoDB reconnection...');
+      mongoose.connect(MONGODB_CONFIG.URI, MONGODB_CONFIG.options);
+    }, 5000);
+  });
+
+// Handle MongoDB connection events
+mongoose.connection.on('disconnected', () => {
+  Logger.warn('mongodb', '⚠️ Disconnected from MongoDB');
+});
+
+mongoose.connection.on('error', (err) => {
+  Logger.error('mongodb', '❌ MongoDB error', err.message);
+});
+
 
 // Configure CORS for socket.io
 const io = socketIO(server, {
@@ -16,6 +118,66 @@ const io = socketIO(server, {
   pingInterval: 15000, // ✅ Reduced from 25000 for faster detection
   pingTimeout: 45000,  // ✅ Reduced from 60000
 });
+
+// ========== MONGODB SCHEMAS ==========
+
+// User Schema
+const userSchema = new mongoose.Schema({
+  userId: { type: String, unique: true, required: true },
+  userName: { type: String, required: true },
+  email: { type: String, unique: true, sparse: true },
+  authType: { type: String, enum: ['GOOGLE_OAUTH', 'LOCAL', 'GUEST'], default: 'LOCAL' },
+  isGuest: { type: Boolean, default: false },
+  
+  // Profile Information
+  gender: { type: String, enum: ['male', 'female', 'other'], default: 'other' },
+  country: { type: String, default: null },
+  birthDate: { type: Date, default: null },
+  
+  // Avatar & Profile
+  avatarColor: { type: String, default: '#128C7E' },
+  avatarLetter: { type: String, default: 'U' },
+  profileImageUrl: { type: String, default: null }, // ✅ URL only (from Google or external)
+  useColorProfile: { type: Boolean, default: true },
+  pictureName: { type: String, default: null },
+  
+  // Social Stats
+  likeCount: { type: Number, default: 0 },
+  likedUserIds: { type: [String], default: [] },
+  starCount: { type: Number, default: 0 },
+  
+  // Account Status
+  isActive: { type: Boolean, default: true },
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now },
+  lastLogin: { type: Date, default: null },
+});
+
+// Blocked Users Schema (tracks blocks and time-based unblocks)
+const blockedUserSchema = new mongoose.Schema({
+  userId: { type: String, required: true },
+  blockedByUserId: { type: String, required: true }, // Who blocked this user
+  reason: { type: String, default: 'User reported' },
+  blockType: { type: String, enum: ['report', 'manual'], default: 'report' },
+  blockDuration: { type: Number, default: null }, // milliseconds (null = permanent)
+  blockedUntil: { type: Date, default: null }, // When this block expires
+  reportCount: { type: Number, default: 1 }, // How many reports led to this block
+  reporters: { type: [String], default: [] }, // List of reporter IDs
+  createdAt: { type: Date, default: Date.now },
+});
+
+// Report History Schema (tracks all reports against a user)
+const reportSchema = new mongoose.Schema({
+  reportedUserId: { type: String, required: true, index: true },
+  reporterId: { type: String, required: true },
+  reason: { type: String, default: 'User reported' },
+  createdAt: { type: Date, default: Date.now, expires: 86400 }, // Auto-delete after 24 hours
+});
+
+// Create Models
+const User = mongoose.model('User', userSchema);
+const BlockedUser = mongoose.model('BlockedUser', blockedUserSchema);
+const Report = mongoose.model('Report', reportSchema);
 
 // Simple lookup endpoint to help debug join-by-invite behavior from clients
 app.get('/room/by-invite/:code', (req, res) => {
@@ -65,16 +227,18 @@ app.get('/room/by-invite/:code', (req, res) => {
   }
 });
 
+// ✅ Create rate limiters for auth endpoints
+const validateTokenLimiter = createRateLimiter('validate-token', 10, 15 * 60); // 10 per 15 minutes
+const registerLimiter = createRateLimiter('register', 3, 60 * 60); // 3 per hour
+const loginLimiter = createRateLimiter('login', 5, 15 * 60); // 5 per 15 minutes
+
 // Google OAuth Token Validation Endpoint (No Firebase required)
-app.post('/auth/validate-token', async (req, res) => {
+app.post('/auth/validate-token', validateTokenLimiter, asyncHandler(async (req, res) => {
   try {
-    const { idToken } = req.body;
+    const { idToken, googleUserData } = req.body;
 
     if (!idToken) {
-      return res.status(400).json({
-        success: false,
-        error: 'ID token is required',
-      });
+      return sendError(res, 400, 'ID token is required');
     }
 
     // Validate token with Google's API
@@ -90,11 +254,7 @@ app.post('/auth/validate-token', async (req, res) => {
         `Token validation failed: ${tokenResponse.status}`,
         { status: tokenResponse.status }
       );
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid or expired token',
-        code: 'INVALID_TOKEN',
-      });
+      return sendError(res, 401, 'Invalid or expired token', 'INVALID_TOKEN');
     }
 
     const tokenData = await tokenResponse.json();
@@ -105,9 +265,30 @@ app.post('/auth/validate-token', async (req, res) => {
       emailVerified: tokenData.email_verified,
     });
 
-    return res.json({
-      success: true,
-      message: 'Token is valid',
+    // ✅ Save or update user in MongoDB after Google validation
+    const userId = tokenData.sub;
+    const userData = {
+      userId,
+      email: tokenData.email,
+      userName: googleUserData?.displayName || tokenData.name || 'User',
+      authType: 'GOOGLE_OAUTH',
+      isGuest: false,
+      profileImageUrl: tokenData.picture || googleUserData?.photoUrl || null,
+      lastLogin: new Date(),
+    };
+
+    try {
+      const user = await User.findOneAndUpdate(
+        { userId },
+        { ...userData, updatedAt: new Date() },
+        { upsert: true, new: true }
+      );
+      Logger.info('oauth/validate', '✅ User saved/updated in MongoDB', { userId });
+    } catch (dbErr) {
+      Logger.error('oauth/validate', 'Error saving user to MongoDB', dbErr.message);
+    }
+
+    return sendSuccess(res, {
       user: {
         id: tokenData.sub,
         email: tokenData.email,
@@ -115,17 +296,175 @@ app.post('/auth/validate-token', async (req, res) => {
         name: tokenData.name,
         picture: tokenData.picture,
       },
-    });
+    }, 'Token is valid');
   } catch (err) {
     Logger.error('oauth/validate', 'Error validating token', err && err.message);
-    return res.status(500).json({
-      success: false,
-      error: 'Token validation error',
-      details: err && err.message,
-    });
+    return sendError(res, 500, 'Token validation error', { details: err?.message });
   }
+}));
 
-  
+// ========== NEW: REGISTER ENDPOINT ==========
+app.post('/auth/register', registerLimiter, validateRegistration, asyncHandler(async (req, res) => {
+  try {
+    const { userId, userName, email, password, gender, country, avatarColor } = req.body;
+
+    if (!userId || !userName || !email) {
+      return sendError(res, 400, 'userId, userName, and email are required');
+    }
+
+    // Check if user already exists
+    const existingUser = await User.findOne({ $or: [{ userId }, { email }] });
+    if (existingUser) {
+      return sendError(res, 409, 'User already exists', 'USER_EXISTS');
+    }
+
+    // Hash password if provided
+    let hashedPassword = null;
+    if (password) {
+      hashedPassword = await bcrypt.hash(password, 10);
+    }
+
+    // Create new user
+    const newUser = new User({
+      userId,
+      userName,
+      email,
+      authType: 'LOCAL',
+      isGuest: false,
+      gender: gender || 'other',
+      country: country || null,
+      avatarColor: avatarColor || '#128C7E',
+      lastLogin: new Date(),
+    });
+
+    await newUser.save();
+
+    Logger.info('auth/register', '✅ New user registered', { userId, email });
+
+    return sendSuccess(res, {
+      user: {
+        userId: newUser.userId,
+        userName: newUser.userName,
+        email: newUser.email,
+      },
+    }, 'User registered successfully');
+  } catch (err) {
+    Logger.error('auth/register', 'Error registering user', err.message);
+    return sendError(res, 500, 'Registration error', { details: err.message });
+  }
+}));
+
+// ========== NEW: LOGIN ENDPOINT ==========
+app.post('/auth/login', loginLimiter, validateAuth, asyncHandler(async (req, res) => {
+  try {
+    const { userId, email, password } = req.body;
+
+    if (!userId && !email) {
+      return sendError(res, 400, 'userId or email is required');
+    }
+
+    // Find user
+    const user = await User.findOne({
+      $or: [{ userId }, { email }],
+    });
+
+    if (!user) {
+      return sendError(res, 404, 'User not found', 'USER_NOT_FOUND');
+    }
+
+    // Update last login
+    user.lastLogin = new Date();
+    await user.save();
+
+    Logger.info('auth/login', '✅ User logged in', { userId: user.userId, email: user.email });
+
+    return sendSuccess(res, {
+      user: {
+        userId: user.userId,
+        userName: user.userName,
+        email: user.email,
+        gender: user.gender,
+        country: user.country,
+        avatarColor: user.avatarColor,
+        profileImageUrl: user.profileImageUrl,
+        likeCount: user.likeCount,
+        starCount: user.starCount,
+      },
+    }, 'Login successful');
+  } catch (err) {
+    Logger.error('auth/login', 'Error during login', err.message);
+    return sendError(res, 500, 'Login error', { details: err.message });
+  }
+}));
+
+// ========== NEW: GET USER PROFILE ENDPOINT ==========
+app.get('/user/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    const user = await User.findOne({ userId });
+    if (!user) {
+      return sendError(res, 404, 'User not found', 'USER_NOT_FOUND');
+    }
+
+    return sendSuccess(res, {
+      user: {
+        userId: user.userId,
+        userName: user.userName,
+        email: user.email,
+        gender: user.gender,
+        country: user.country,
+        avatarColor: user.avatarColor,
+        profileImageUrl: user.profileImageUrl,
+        likeCount: user.likeCount,
+        starCount: user.starCount,
+        createdAt: user.createdAt,
+      },
+    });
+  } catch (err) {
+    Logger.error('user/get', 'Error retrieving user', err.message);
+    return sendError(res, 500, 'Error retrieving user', { details: err.message });
+  }
+});
+
+// ========== NEW: UPDATE USER PROFILE ENDPOINT ==========
+app.post('/user/:userId/update', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { userName, gender, country, avatarColor, profileImageUrl, pictureName } = req.body;
+
+    const user = await User.findOne({ userId });
+    if (!user) {
+      return sendError(res, 404, 'User not found', 'USER_NOT_FOUND');
+    }
+
+    // Update fields
+    if (userName) user.userName = userName;
+    if (gender) user.gender = gender;
+    if (country) user.country = country;
+    if (avatarColor) user.avatarColor = avatarColor;
+    if (profileImageUrl) user.profileImageUrl = profileImageUrl;
+    if (pictureName) user.pictureName = pictureName;
+    user.updatedAt = new Date();
+
+    await user.save();
+
+    Logger.info('user/update', '✅ User profile updated', { userId });
+
+    return sendSuccess(res, {
+      user: {
+        userId: user.userId,
+        userName: user.userName,
+        gender: user.gender,
+        country: user.country,
+        avatarColor: user.avatarColor,
+        profileImageUrl: user.profileImageUrl,
+      },
+    }, 'User profile updated successfully');
+  } catch (err) {
+    Logger.error('user/update', 'Error updating user', err.message);
+    return sendError(res, 500, 'Error updating user', { details: err.message });
+  }
 });
 
 // ========== CONFIGURATION ==========
@@ -137,6 +476,8 @@ const CONFIG = {
   STALE_TIMEOUT: 5 * 60 * 1000, // 5 minutes
   CLEANUP_INTERVAL: 60 * 1000, // 60 seconds
   MAX_USERNAME_LENGTH: 50,
+  // ✅ GROUP ROOM CAPACITY: 10-user limit per room with auto-replica creation
+  GROUP_ROOM_CAPACITY: 10,
   // ✅ OPTIMIZE: Faster member list sync
   MEMBER_SYNC_INTERVAL: 500, // ms - how often to sync member list to room
   PRESENCE_BROADCAST_INTERVAL: 250, // ms - debounce status broadcasts
@@ -232,115 +573,179 @@ const REPORT_CONFIG = {
 // ========== GENDER FILTER SYSTEM ==========
 const userGenderPreferences = new Map(); // userId -> 'male'|'female'|'other'|'all'
 
-// Clean and check if a user is blocked
-function isUserBlocked(userId) {
-  if (!reportedUsers.has(userId)) return false;
-  const entry = reportedUsers.get(userId);
-  const now = Date.now();
-  
-  // Check if block has expired
-  if (entry.blockedUntil && entry.blockedUntil > now) {
-    return true;
-  }
-  
-  // Clean expired block
-  if (entry.blockedUntil && entry.blockedUntil <= now) {
-    entry.blockedUntil = null;
-  }
-  
-  // Clean old reports (outside 24h window)
-  let hasChanges = false;
-  if (entry.reports) {
-    const cutoff = now - REPORT_CONFIG.reportWindowMs;
-    const reporterIds = Object.keys(entry.reports);
-    for (const reporterId of reporterIds) {
-      if (entry.reports[reporterId] < cutoff) {
-        delete entry.reports[reporterId];
-        hasChanges = true;
-      }
+// ========== BLOCKING & REPORTING SYSTEM (MONGODB-BACKED) ==========
+
+// Check if a user is currently blocked
+async function isUserBlocked(userId) {
+  try {
+    const now = new Date();
+    
+    // Find active blocks
+    const block = await BlockedUser.findOne({
+      userId,
+      $or: [
+        { blockedUntil: null }, // Permanent blocks
+        { blockedUntil: { $gte: now } }, // Temporary blocks still active
+      ],
+    });
+    
+    if (block && block.blockedUntil && block.blockedUntil <= now) {
+      // Block has expired, delete it
+      await BlockedUser.deleteOne({ _id: block._id });
+      return false;
     }
-  }
-  
-  // Remove entry if empty
-  if ((!entry.reports || Object.keys(entry.reports).length === 0) && !entry.blockedUntil) {
-    reportedUsers.delete(userId);
+    
+    return !!block;
+  } catch (err) {
+    Logger.error('isUserBlocked', 'Error checking block status', err.message);
     return false;
   }
-  
-  // 🔒 CRITICAL FIX: Save changes back to the Map
-  if (hasChanges) {
-    reportedUsers.set(userId, entry);
-  }
-  
-  return false;
 }
 
-// Process a report from a reporter
-function recordReport(reportedUserId, reporterId) {
-  Logger.info('recordReport', 'CALLED', { reportedUserId, reporterId });
-  
-  if (!reportedUserId || !reporterId) {
-    Logger.warn('recordReport', 'Invalid inputs', { reportedUserId, reporterId });
+// Record a report and apply progressive blocking
+async function recordReport(reportedUserId, reporterId, reason = 'User reported') {
+  try {
+    Logger.info('recordReport', 'Processing report', { reportedUserId, reporterId });
+    
+    if (!reportedUserId || !reporterId) {
+      Logger.warn('recordReport', 'Invalid inputs', { reportedUserId, reporterId });
+      return false;
+    }
+    
+    // Check if this reporter already reported this user in last 24 hours
+    const existingReport = await Report.findOne({
+      reportedUserId,
+      reporterId,
+      createdAt: { $gte: new Date(Date.now() - REPORT_CONFIG.reportWindowMs) },
+    });
+    
+    if (existingReport) {
+      Logger.warn('recordReport', 'Duplicate report from same reporter within 24 hours', {
+        reportedUserId,
+        reporterId,
+      });
+      return false;
+    }
+    
+    // Create new report
+    const newReport = new Report({
+      reportedUserId,
+      reporterId,
+      reason,
+    });
+    await newReport.save();
+    
+    // Count recent unique reports
+    const recentReports = await Report.find({
+      reportedUserId,
+      createdAt: { $gte: new Date(Date.now() - REPORT_CONFIG.reportWindowMs) },
+    }).distinct('reporterId');
+    
+    const reportCount = recentReports.length;
+    Logger.info('recordReport', 'Recent report count', { reportedUserId, count: reportCount });
+    
+    // Determine block duration based on report count
+    let blockDuration = null;
+    let blockReason = '';
+    
+    if (reportCount >= 5) {
+      blockDuration = REPORT_CONFIG.blockDuration_5reports_Ms;
+      blockReason = '5+ reports - 24 hour block';
+    } else if (reportCount >= 3) {
+      blockDuration = REPORT_CONFIG.blockDuration_3reports_Ms;
+      blockReason = '3+ reports - 3 hour block';
+    } else if (reportCount >= 1) {
+      blockDuration = REPORT_CONFIG.blockDuration_1report_Ms;
+      blockReason = '1+ reports - 10 minute block';
+    }
+    
+    if (blockDuration) {
+      const blockedUntil = new Date(Date.now() + blockDuration);
+      
+      // Create or update block
+      await BlockedUser.findOneAndUpdate(
+        { userId: reportedUserId },
+        {
+          userId: reportedUserId,
+          blockedByUserId: reporterId,
+          reason: blockReason,
+          blockType: 'report',
+          blockDuration,
+          blockedUntil,
+          reportCount,
+          reporters: recentReports,
+        },
+        { upsert: true, new: true }
+      );
+      
+      Logger.warn('recordReport', `User blocked: ${blockReason}`, {
+        reportedUserId,
+        reportCount,
+        blockedUntil,
+      });
+    }
+    
+    return true;
+  } catch (err) {
+    Logger.error('recordReport', 'Error recording report', err.message);
     return false;
   }
-  
-  const now = Date.now();
-  let entry = reportedUsers.get(reportedUserId) || { reports: {}, blockedUntil: null };
-  
-  Logger.info('recordReport', 'Retrieved entry', { reportedUserId, existingReports: Object.keys(entry.reports || {}).length, blockedUntil: entry.blockedUntil });
-  
-  // Clean old reports
-  const cutoff = now - REPORT_CONFIG.reportWindowMs;
-  const reporterIds = Object.keys(entry.reports || {});
-  Logger.info('recordReport', 'Cleaning old reports', { reporterIds: reporterIds.length, cutoff });
-  
-  for (const rId of reporterIds) {
-    const reportTimestamp = entry.reports[rId];
-    Logger.info('recordReport', 'Checking report age', { reporter: rId, timestamp: reportTimestamp, cutoff, isOld: reportTimestamp < cutoff });
+}
+
+// Manually block a user (by userId, for abuse prevention)
+async function blockUser(userId, duration = null, reason = 'Manual block') {
+  try {
+    Logger.info('blockUser', 'Blocking user', { userId, duration, reason });
     
-    if ((entry.reports[rId] || 0) < cutoff) {
-      delete entry.reports[rId];
-      Logger.info('recordReport', 'Deleted old report', { reporter: rId });
-    }
+    const blockedUntil = duration ? new Date(Date.now() + duration) : null;
+    
+    await BlockedUser.findOneAndUpdate(
+      { userId },
+      {
+        userId,
+        blockedByUserId: 'SYSTEM',
+        reason,
+        blockType: 'manual',
+        blockDuration: duration,
+        blockedUntil,
+      },
+      { upsert: true, new: true }
+    );
+    
+    Logger.info('blockUser', '✅ User blocked', { userId, blockedUntil });
+    return true;
+  } catch (err) {
+    Logger.error('blockUser', 'Error blocking user', err.message);
+    return false;
   }
-  
-  if (!entry.reports) entry.reports = {};
-  entry.reports[reporterId] = now;
-  Logger.info('recordReport', 'Added new report', { reporter: reporterId, timestamp: now });
-  
-  // Progressive blocking based on unique reporter count
-  const uniqueReporters = Object.keys(entry.reports).length;
-  Logger.info('recordReport', 'Unique reporter count', { reportedUserId, count: uniqueReporters });
-  
-  let blockDuration = 0;
-  let blockReason = '';
-  
-  if (uniqueReporters >= 5) {
-    blockDuration = REPORT_CONFIG.blockDuration_5reports_Ms;
-    blockReason = '5 reports - 1 day block';
-  } else if (uniqueReporters >= 3) {
-    blockDuration = REPORT_CONFIG.blockDuration_3reports_Ms;
-    blockReason = '3 reports - 3 hour block';
-  } else if (uniqueReporters >= 1) {
-    blockDuration = REPORT_CONFIG.blockDuration_1report_Ms;
-    blockReason = '1 report - 10 minute block';
+}
+
+// Unblock a user
+async function unblockUser(userId) {
+  try {
+    await BlockedUser.deleteOne({ userId });
+    Logger.info('unblockUser', '✅ User unblocked', { userId });
+    return true;
+  } catch (err) {
+    Logger.error('unblockUser', 'Error unblocking user', err.message);
+    return false;
   }
-  
-  if (blockDuration > 0) {
-    entry.blockedUntil = now + blockDuration;
-    Logger.warn('reportReport', `User ${reportedUserId} blocked: ${blockReason}`, { 
-      reportedUserId, 
-      uniqueReporters,
-      reporters: Object.keys(entry.reports),
-      blockedUntil: entry.blockedUntil,
-      blockReason
-    });
+}
+
+// Update user stats in MongoDB
+async function updateUserStats(userId, likeCount, starCount) {
+  try {
+    await User.findOneAndUpdate(
+      { userId },
+      {
+        likeCount: likeCount || 0,
+        starCount: starCount || 0,
+        updatedAt: new Date(),
+      }
+    );
+  } catch (err) {
+    Logger.error('updateUserStats', 'Error updating user stats', err.message);
   }
-  
-  reportedUsers.set(reportedUserId, entry);
-  Logger.info('recordReport', 'Saved entry', { reportedUserId, finalReportCount: Object.keys(entry.reports).length, blockedUntil: entry.blockedUntil });
-  
-  return true;
 }
 
 // ========== RATE LIMITING ==========
@@ -366,28 +771,6 @@ function checkRateLimit(socketId) {
   return true;
 }
 
-// ========== LOGGER UTILITY ==========
-class Logger {
-  static log(level, context, message, data = null) {
-    const timestamp = new Date().toISOString();
-    const logEntry = `[${timestamp}] [${level}] [${context}] ${message}`;
-    const logFn = level === 'ERROR' ? console.error : console.log;
-    logFn(logEntry, data || '');
-  }
-
-  static info(context, message, data) {
-    this.log('INFO', context, message, data);
-  }
-
-  static warn(context, message, data) {
-    this.log('WARN', context, message, data);
-  }
-
-  static error(context, message, data) {
-    this.log('ERROR', context, message, data);
-  }
-}
-
 // ========== HEALTH CHECK ENDPOINT ==========
 app.get('/health', (req, res) => {
   try {
@@ -406,22 +789,6 @@ app.get('/health', (req, res) => {
 });
 
 // ========== VALIDATION & UTILITIES ==========
-function validateUserData(userData) {
-  if (!userData || typeof userData !== 'object') {
-    return { valid: false, error: 'Invalid user data object' };
-  }
-  if (typeof userData.userId !== 'string' || userData.userId.length === 0) {
-    return { valid: false, error: 'Invalid userId' };
-  }
-  if (typeof userData.userName !== 'string' || userData.userName.length === 0) {
-    return { valid: false, error: 'Invalid userName' };
-  }
-  if (userData.userName.length > CONFIG.MAX_USERNAME_LENGTH) {
-    return { valid: false, error: `userName exceeds ${CONFIG.MAX_USERNAME_LENGTH} characters` };
-  }
-  return { valid: true };
-}
-
 function isValidSocketId(socketId) {
   return typeof socketId === 'string' && socketId.length > 0;
 }
@@ -510,7 +877,7 @@ function decomposeRoom(socketId, roomType = 'video') {
   }
 }
 
-function attemptMatch(roomType = 'video') {
+async function attemptMatch(roomType = 'video') {
   try {
     const pairings = roomType === 'video' ? videoPairings : chatPairings;
     const queue = roomType === 'video' ? videoQueue : chatQueue;
@@ -536,9 +903,9 @@ function attemptMatch(roomType = 'video') {
       return false;
     }
     
-    // 🔒 CRITICAL FIX: Check if either user is blocked due to reports
-    const user1Blocked = user1.userData && user1.userData.userId && isUserBlocked(user1.userData.userId);
-    const user2Blocked = user2.userData && user2.userData.userId && isUserBlocked(user2.userData.userId);
+    // ✅ CRITICAL FIX: AWAIT async blocking check instead of fire-and-forget
+    const user1Blocked = user1.userData && user1.userData.userId && (await isUserBlocked(user1.userData.userId));
+    const user2Blocked = user2.userData && user2.userData.userId && (await isUserBlocked(user2.userData.userId));
     
     if (user1Blocked) {
       Logger.warn('attemptMatch', 'User1 is blocked, requeuing User2', { user1Id: user1.socketId, user2Id: user2.socketId });
@@ -606,26 +973,36 @@ function attemptMatch(roomType = 'video') {
       user2ActualGender: user2UserGender,
     });
 
-    // Check if user1's gender preference matches user2's gender
-    if (user1Gender !== 'all' && user1Gender !== user2UserGender) {
-      Logger.warn('attemptMatch', 'Gender mismatch - user1 preference incompatible', {
-        user1Gender: user1Gender,
-        user2ActualGender: user2UserGender,
-        action: 'requeue_user2',
-      });
-      queue.push(user2);
-      return false;
-    }
+    // ✅ IMPROVED: If EITHER user selected "All", they're open to everyone → MATCH
+    // Otherwise, check mutual compatibility:
+    // - User1's preference must match User2's actual gender
+    // - User2's preference must match User1's actual gender
+    
+    const user1HasAllFilter = user1Gender === 'all';
+    const user2HasAllFilter = user2Gender === 'all';
 
-    // Check if user2's gender preference matches user1's gender
-    if (user2Gender !== 'all' && user2Gender !== user1UserGender) {
-      Logger.warn('attemptMatch', 'Gender mismatch - user2 preference incompatible', {
-        user2Gender: user2Gender,
-        user1ActualGender: user1UserGender,
-        action: 'requeue_user1',
-      });
-      queue.push(user1);
-      return false;
+    // If either has "All" selected, they match (open to everyone)
+    if (!user1HasAllFilter && !user2HasAllFilter) {
+      // Both have specific preferences - check mutual compatibility
+      if (user1Gender !== user2UserGender) {
+        Logger.warn('attemptMatch', 'Gender mismatch - user1 preference incompatible', {
+          user1Gender: user1Gender,
+          user2ActualGender: user2UserGender,
+          action: 'requeue_user2',
+        });
+        queue.push(user2);
+        return false;
+      }
+
+      if (user2Gender !== user1UserGender) {
+        Logger.warn('attemptMatch', 'Gender mismatch - user2 preference incompatible', {
+          user2Gender: user2Gender,
+          user1ActualGender: user1UserGender,
+          action: 'requeue_user1',
+        });
+        queue.push(user1);
+        return false;
+      }
     }
 
     Logger.info('attemptMatch', 'Gender compatibility passed - proceeding with match', {
@@ -706,6 +1083,30 @@ function attemptMatch(roomType = 'video') {
       pairingForUser1: pairings.get(user1.socketId) ? 'exists' : 'missing',
       pairingForUser2: pairings.get(user2.socketId) ? 'exists' : 'missing',
     });
+
+    // ✅ NEW: Send connection_ready event after both users are matched 
+    // This ensures client waits for server confirmation before showing animation
+    setImmediate(() => {
+      try {
+        io.to(user1.socketId).emit('connection_ready', {
+          matchId,
+          peerId: user2.socketId,
+          readyAt: Date.now(),
+        });
+        io.to(user2.socketId).emit('connection_ready', {
+          matchId,
+          peerId: user1.socketId,
+          readyAt: Date.now(),
+        });
+        Logger.info('attemptMatch', 'connection_ready events sent to both peers', {
+          user1: user1.socketId,
+          user2: user2.socketId,
+        });
+      } catch (err) {
+        Logger.error('attemptMatch', 'Error sending connection_ready', err.message);
+      }
+    });
+
     return true;
   } catch (error) {
     Logger.error('attemptMatch', 'Error during matching', error.message);
@@ -1135,13 +1536,13 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ✅ NEW: Report a user
-  socket.on('report_user', (data, callback) => {
+  // ✅ NEW: Report a user (MongoDB-backed)
+  socket.on('report_user', async (data, callback) => {
     try {
       Logger.info('report_user', 'RECEIVED report_user event', { data });
       
       const reportedUserId = (data && data.reportedUserId) || (data && data.userId);
-      const reporterId = (data && data.reporterId);
+      const reporterId = (data && data.reporterId) || (socketMetadata.get(socket.id)?.userId);
       const reason = (data && data.reason) || 'Unspecified';
       
       Logger.info('report_user', 'Parsed data', { reportedUserId, reporterId, reason });
@@ -1159,12 +1560,41 @@ io.on('connection', (socket) => {
         return;
       }
       
-      const result = recordReport(reportedUserId, reporterId);
-      Logger.info('report_user', `User ${reportedUserId} reported by ${reporterId}`, { reported: reportedUserId, reporter: reporterId, recordResult: result });
+      // Record report in MongoDB
+      const result = await recordReport(reportedUserId, reporterId, reason);
+      Logger.info('report_user', `User ${reportedUserId} reported by ${reporterId}`, { 
+        reported: reportedUserId, 
+        reporter: reporterId, 
+        recordResult: result 
+      });
+      
+      // Check if user is now blocked
+      const isBlocked = await isUserBlocked(reportedUserId);
+      if (isBlocked) {
+        Logger.warn('report_user', 'Reported user is now blocked', { reportedUserId });
+        
+        // If reported user is online, disconnect them gracefully
+        const reportedUserSocketId = userSockets.get(reportedUserId);
+        if (reportedUserSocketId) {
+          io.to(reportedUserSocketId).emit('user_blocked_notification', {
+            reason: 'Your account has been temporarily blocked due to community reports.',
+            timestamp: Date.now(),
+          });
+          
+          // Decompose any active pairings
+          decomposeRoom(reportedUserSocketId, 'video');
+          decomposeRoom(reportedUserSocketId, 'chat');
+          
+          Logger.info('report_user', 'Blocked user disconnected from pairings', { reportedUserId, socketId: reportedUserSocketId });
+        }
+      }
       
       // Send notification to the reported user if they're online
       const reportedUserSocketId = userSockets.get(reportedUserId);
-      Logger.info('report_user', `Looking up online status for ${reportedUserId}`, { socketId: reportedUserSocketId, allOnlineUsers: Array.from(userSockets.keys()).length });
+      Logger.info('report_user', `Looking up online status for ${reportedUserId}`, { 
+        socketId: reportedUserSocketId, 
+        allOnlineUsers: Array.from(userSockets.keys()).length 
+      });
       
       if (reportedUserSocketId) {
         io.to(reportedUserSocketId).emit('report_notification', {
@@ -1173,11 +1603,9 @@ io.on('connection', (socket) => {
           timestamp: Date.now(),
         });
         Logger.info('report_user', `Notification sent to ${reportedUserId}`, { socketId: reportedUserSocketId });
-      } else {
-        Logger.info('report_user', `User ${reportedUserId} not online, notification queued for when they return`, { reportedUserId });
       }
       
-      if (callback) callback({ success: true });
+      if (callback) callback({ success: true, message: 'Report recorded successfully', isBlocked });
     } catch (error) {
       Logger.error('report_user', 'Error recording report', error.message);
       if (callback) callback({ success: false, error: 'Failed to record report' });
@@ -1217,8 +1645,8 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Find partner for video/chat
-  socket.on('find_partner', (data) => {
+  // Find partner for video/chat (MongoDB-backed blocking checks)
+  socket.on('find_partner', async (data) => {
     try {
       // Rate limiting check
       if (!checkRateLimit(socket.id)) {
@@ -1250,17 +1678,20 @@ io.on('connection', (socket) => {
         return;
       }
 
-      // ✅ NEW: Check if user is blocked by reports
+      // ✅ NEW: Check if user is blocked by reports (MongoDB-backed, async)
       if (userData && userData.userId) {
-        if (isUserBlocked(userData.userId)) {
-          Logger.warn('find_partner', 'Blocked user attempted to find partner', { userId: userData.userId, userName: userData.userName });
+        const blocked = await isUserBlocked(userData.userId);
+        if (blocked) {
+          Logger.warn('find_partner', 'Blocked user attempted to find partner', { 
+            userId: userData.userId, 
+            userName: userData.userName 
+          });
           
-          // Get remaining block time with actual duration
-          let remainingMs = 0;
-          const entry = reportedUsers.get(userData.userId);
-          if (entry && entry.blockedUntil) {
-            remainingMs = Math.max(0, entry.blockedUntil - Date.now());
-          }
+          // Get block info from MongoDB
+          const blockInfo = await BlockedUser.findOne({ userId: userData.userId });
+          const remainingMs = blockInfo && blockInfo.blockedUntil 
+            ? Math.max(0, blockInfo.blockedUntil - Date.now())
+            : 0;
           
           const remainingSeconds = Math.ceil(remainingMs / 1000);
           const hours = Math.floor(remainingSeconds / 3600);
@@ -1277,7 +1708,7 @@ io.on('connection', (socket) => {
             code: 'USER_BLOCKED',
             message: `You are blocked from pairing. Blocked for ${timeStr}.`,
             remainingSeconds: remainingSeconds,
-            blockedUntil: entry?.blockedUntil,
+            blockedUntil: blockInfo?.blockedUntil,
           });
           return;
         }
@@ -1346,7 +1777,7 @@ io.on('connection', (socket) => {
         queueSizeBeforeMatch: queue.length,
       });
 
-      const matchResult = attemptMatch(roomType);
+      const matchResult = await attemptMatch(roomType);
 
       Logger.info('find_partner', 'Match attempt completed', {
         socketId: socket.id,
@@ -1767,17 +2198,92 @@ io.on('connection', (socket) => {
     }
   }, MESSAGE_CACHE_TIMEOUT);
   
+  // ✅ NEW: Get group members list (for members dialog)
+  socket.on('get_group_members', (data, callback) => {
+    try {
+      const groupName = data && data.groupName ? String(data.groupName).trim() : null;
+      if (!groupName) {
+        if (callback) callback({ success: false, error: 'Invalid group name' });
+        return;
+      }
+
+      const roomSet = groupChatRooms.get(groupName);
+      if (!roomSet) {
+        if (callback) callback({ success: false, members: [], memberCount: 0 });
+        return;
+      }
+
+      // ✅ Get all members with complete profile data for animations
+      const members = [];
+      for (const memberSocketId of roomSet) {
+        const memberMeta = socketMetadata.get(memberSocketId) || {};
+        members.push({
+          socketId: memberSocketId,
+          userId: memberMeta.userId || '',
+          userName: memberMeta.userName || 'Unknown User',
+          avatarColor: memberMeta.avatarColor || '#128C7E',
+          avatarLetter: (memberMeta.avatarLetter || (memberMeta.userName ? memberMeta.userName.charAt(0).toUpperCase() : 'U')).substring(0, 1),
+          profileImagePath: memberMeta.profileImagePath || null,
+          senderProfileImagePath: memberMeta.profileImagePath || null,
+        });
+      }
+
+      Logger.info('get_group_members', 'Fetched group members', {
+        groupName,
+        memberCount: members.length,
+      });
+
+      if (callback) {
+        callback({
+          success: true,
+          groupName,
+          members,
+          memberCount: members.length,
+        });
+      }
+    } catch (error) {
+      Logger.error('get_group_members', 'Error getting group members', error.message);
+      if (callback) callback({ success: false, error: 'Failed to get members' });
+    }
+  });
+
   // User joins a group
   socket.on('join_group', (data, callback) => {
     try {
-      const groupName = data && data.groupName ? String(data.groupName).trim() : null;
+      let groupName = data && data.groupName ? String(data.groupName).trim() : null;
       if (!groupName) {
         Logger.warn('join_group', 'Invalid group name', { socketId: socket.id });
         if (callback) callback({ success: false, error: 'Invalid group name' });
         return;
       }
 
-      // Get or create room
+      // ✅ NEW: Room replica system - if room is at capacity, find or create a replica
+      const baseGroupName = data && data.groupName ? String(data.groupName).trim() : groupName;
+      let replicaIndex = 0;
+      let actualRoomName = baseGroupName;
+      let isReplica = false;
+      
+      // Find the first available room (base or replica) with space
+      while (groupChatRooms.has(actualRoomName)) {
+        const currentSet = groupChatRooms.get(actualRoomName);
+        if (currentSet.size < CONFIG.GROUP_ROOM_CAPACITY) {
+          // Found a room with space
+          groupName = actualRoomName;
+          isReplica = replicaIndex > 0;
+          break;
+        }
+        // Room is full, try next replica
+        replicaIndex++;
+        actualRoomName = `${baseGroupName}_replica${replicaIndex}`;
+      }
+
+      // If no existing room has space, use the next available room name
+      if (groupName === data.groupName) {
+        groupName = actualRoomName;
+        isReplica = replicaIndex > 0;
+      }
+
+      // Get or create room (main or replica)
       if (!groupChatRooms.has(groupName)) {
         groupChatRooms.set(groupName, new Set());
       }
@@ -1810,15 +2316,43 @@ io.on('connection', (socket) => {
         userName: data?.userName,
         groupName,
         memberCount,
+        isReplica,
         wasAlreadyMember,
       });
 
-      // Notify all users in group (including the new joiner)
+      // ✅ FIXED: Send complete member list to new joiner (for animations)
+      const allMembers = [];
+      for (const memberSocketId of roomSet) {
+        const memberMeta = socketMetadata.get(memberSocketId) || {};
+        allMembers.push({
+          socketId: memberSocketId,
+          userId: memberMeta.userId || '',
+          userName: memberMeta.userName || 'Unknown User',
+          avatarColor: memberMeta.avatarColor || '#128C7E',
+          avatarLetter: memberMeta.avatarLetter || 'U',
+          profileImagePath: memberMeta.profileImagePath || null,
+          senderProfileImagePath: memberMeta.profileImagePath || null,
+        });
+      }
+
+      // Send joiner the full member list
+      socket.emit('group_members_list', {
+        groupName,
+        members: allMembers,
+        memberCount,
+        timestamp: new Date().toISOString(),
+      });
+
+      // Notify all users in group (including the new joiner) of new member with full data
       io.to(`group_${groupName}`).emit('user_joined_group', {
         groupName,
         groupIcon: data?.groupIcon || '💬',
+        groupId: data?.groupId || null,
+        senderSocketId: socket.id,
         userId: data?.userId,
         userName: data?.userName || 'Unknown User',
+        profileImagePath: data?.profileImagePath || data?.senderProfileImagePath || null,
+        senderProfileImagePath: data?.senderProfileImagePath || data?.profileImagePath || null,
         avatarColor: data?.avatarColor || '#128C7E',
         avatarLetter: data?.avatarLetter || 'U',
         memberCount,
@@ -1826,10 +2360,14 @@ io.on('connection', (socket) => {
       });
 
       if (callback) {
+        // ✅ FIXED: Send complete member list in callback response
         callback({
           success: true,
           groupName,
           memberCount,
+          capacity: CONFIG.GROUP_ROOM_CAPACITY || 10,
+          roomName: groupName,
+          allMembers: allMembers,
           message: `Joined ${groupName}. Total members: ${memberCount}`,
         });
       }
@@ -1842,6 +2380,20 @@ io.on('connection', (socket) => {
   // User sends message to group
   socket.on('send_group_message', (data, callback) => {
     try {
+      // ✅ NEW: Rate limiting for message sending (prevent spam)
+      if (!checkRateLimit(socket.id)) {
+        Logger.warn('send_group_message', 'Rate limit exceeded for user', { socketId: socket.id });
+        if (callback) {
+          callback({
+            success: false,
+            error: 'Too many messages. Please slow down.',
+            code: 'RATE_LIMIT_EXCEEDED',
+            retryAfter: 60,
+          });
+        }
+        return;
+      }
+
       const groupName = data && data.groupName ? String(data.groupName).trim() : null;
       const message = data && data.message ? String(data.message).trim() : null;
       const clientMessageId = data && data.messageId ? String(data.messageId).trim() : null;
@@ -2079,6 +2631,21 @@ setInterval(() => {
     Logger.error('cleanup', 'Error during cleanup', error.message);
   }
 }, CONFIG.CLEANUP_INTERVAL);
+
+// ✅ NEW: Periodic online count broadcast (every 5 seconds) - ensures clients always have current count
+setInterval(() => {
+  try {
+    broadcastStats();
+  } catch (err) {
+    Logger.error('periodicBroadcast', 'Error broadcasting stats', err.message);
+  }
+}, 5000);
+
+// ✅ Register not found handler (BEFORE error handler)
+app.use(notFoundHandler);
+
+// ✅ Register error handler (MUST be LAST)
+app.use(errorHandler);
 
 // ========== SERVER STARTUP ==========
 server.listen(CONFIG.PORT, CONFIG.SERVER_BIND, () => {

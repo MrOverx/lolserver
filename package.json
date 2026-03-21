@@ -3,14 +3,21 @@
   "version": "1.0.0",
   "main": "ws_server.js",
   "scripts": {
+    "start": "node ws_server.js",
+    "dev": "nodemon ws_server.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "OmegleLOL WebSocket Server with MongoDB Backend",
   "dependencies": {
     "express": "^5.2.1",
     "nodemon": "^3.1.11",
-    "socket.io": "^4.8.3"
+    "socket.io": "^4.8.3",
+    "mongoose": "^7.5.0",
+    "mongodb": "^5.9.0",
+    "bcryptjs": "^2.4.3",
+    "dotenv": "^16.3.1",
+    "cors": "^2.8.5"
   }
 }
