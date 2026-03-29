@@ -7,17 +7,15 @@ const bcrypt = require('bcryptjs');
 
 // ✅ Import optimization utilities
 const { Logger } = require('./utils/logger');
-const { sendError, sendSuccess, serializeUser, serializeMinimalUser } = require('./utils/responseHandler');
-const { autoRegisterUserIfNeeded, validateUserData } = require('./utils/userRegistration');
+const { sendError, sendSuccess } = require('./utils/responseHandler');
+const { validateUserData } = require('./utils/userRegistration');
 
 // ✅ Import enhancement middleware
-const { validateAuth, validateRegistration, validateProfileUpdate } = require('./middleware/validation');
+const { validateAuth, validateRegistration } = require('./middleware/validation');
 const { globalRateLimit, createRateLimiter, startCleanupInterval } = require('./middleware/rateLimiter');
 const { errorHandler, notFoundHandler, asyncHandler } = require('./middleware/errorHandler');
 
 // ✅ Import enhancement utilities
-const cache = require('./utils/cache');
-const { CACHE_TTL } = require('./utils/cache');
 const health = require('./utils/health');
 
 const app = express();
@@ -54,7 +52,7 @@ startCleanupInterval();
 // Format: mongodb+srv://username:password@cluster.mongodb.net/?appName=databaseName
 const MONGODB_CONFIG = {
   // Primary connection URI from environment or fallback to lolcluster
-  URI: process.env.MONGODB_URI || 'mongodb+srv://overx:ankit5639@lolcluster.68fu58k.mongodb.net/?appName=lolcluster',
+  URI: process.env.MONGODB_URI || 'mongodb+srv://overx:ankit5639@lolcluster.68fu58k.mongodb.net/lolcluster?appName=lolcluster',
   
   // Connection options for optimal performance and frontend compatibility
   options: {
@@ -235,7 +233,8 @@ const loginLimiter = createRateLimiter('login', 5, 15 * 60); // 5 per 15 minutes
 // Google OAuth Token Validation Endpoint (No Firebase required)
 app.post('/auth/validate-token', validateTokenLimiter, asyncHandler(async (req, res) => {
   try {
-    const { idToken, googleUserData } = req.body;
+    const { idToken, googleUser, googleUserData } = req.body;
+    const userMeta = googleUser || googleUserData;
 
     if (!idToken) {
       return sendError(res, 400, 'ID token is required');
@@ -267,29 +266,62 @@ app.post('/auth/validate-token', validateTokenLimiter, asyncHandler(async (req, 
 
     // ✅ Save or update user in MongoDB after Google validation
     const userId = tokenData.sub;
-    const userData = {
+    const userParams = {
       userId,
       email: tokenData.email,
-      userName: googleUserData?.displayName || tokenData.name || 'User',
+      userName: userMeta?.displayName || tokenData.name || 'User',
       authType: 'GOOGLE_OAUTH',
       isGuest: false,
-      profileImageUrl: tokenData.picture || googleUserData?.photoUrl || null,
+      profileImageUrl: tokenData.picture || userMeta?.photoUrl || null,
       lastLogin: new Date(),
+      updatedAt: new Date(),
     };
 
+    let isExistingUser = false;
+    let savedUser = null;
+
     try {
-      const user = await User.findOneAndUpdate(
-        { userId },
-        { ...userData, updatedAt: new Date() },
-        { upsert: true, new: true }
-      );
-      Logger.info('oauth/validate', '✅ User saved/updated in MongoDB', { userId });
+      const existingUser = await User.findOne({ userId });
+      if (existingUser) {
+        isExistingUser = true;
+        existingUser.userName = userParams.userName;
+        existingUser.email = userParams.email;
+        existingUser.authType = userParams.authType;
+        existingUser.isGuest = userParams.isGuest;
+        existingUser.profileImageUrl = userParams.profileImageUrl;
+        existingUser.lastLogin = userParams.lastLogin;
+        existingUser.updatedAt = userParams.updatedAt;
+        savedUser = await existingUser.save();
+      } else {
+        const newUser = new User({
+          ...userParams,
+          gender: 'other',
+          country: null,
+          avatarColor: '#128C7E',
+        });
+        savedUser = await newUser.save();
+      }
+
+      Logger.info('oauth/validate', '✅ User saved/updated in MongoDB', { userId, isExistingUser });
     } catch (dbErr) {
-      Logger.error('oauth/validate', 'Error saving user to MongoDB', dbErr.message);
+      Logger.error('oauth/validate', 'Error saving user to MongoDB', dbErr && dbErr.message);
+      return sendError(res, 500, 'Database error while saving user', { details: dbErr.message });
     }
 
     return sendSuccess(res, {
-      user: {
+      isExistingUser,
+      user: savedUser ? {
+        userId: savedUser.userId,
+        userName: savedUser.userName,
+        email: savedUser.email,
+        gender: savedUser.gender,
+        country: savedUser.country,
+        avatarColor: savedUser.avatarColor,
+        profileImageUrl: savedUser.profileImageUrl,
+        authType: savedUser.authType,
+        isGuest: savedUser.isGuest,
+        lastLogin: savedUser.lastLogin,
+      } : {
         id: tokenData.sub,
         email: tokenData.email,
         emailVerified: tokenData.email_verified === 'true',
@@ -431,7 +463,7 @@ app.get('/user/:userId', async (req, res) => {
 app.post('/user/:userId/update', async (req, res) => {
   try {
     const { userId } = req.params;
-    const { userName, gender, country, avatarColor, profileImageUrl, pictureName } = req.body;
+    const { userName, gender, country, avatarColor, profileImageUrl, profileImagePath, pictureName, birthDate } = req.body;
 
     const user = await User.findOne({ userId });
     if (!user) {
@@ -443,8 +475,20 @@ app.post('/user/:userId/update', async (req, res) => {
     if (gender) user.gender = gender;
     if (country) user.country = country;
     if (avatarColor) user.avatarColor = avatarColor;
+    
+    // Handle both profileImageUrl and profileImagePath (frontend may send either)
     if (profileImageUrl) user.profileImageUrl = profileImageUrl;
+    if (profileImagePath) user.profileImageUrl = profileImagePath;
+    
     if (pictureName) user.pictureName = pictureName;
+    if (birthDate) {
+      try {
+        user.birthDate = new Date(birthDate);
+      } catch (e) {
+        Logger.warn('user/update', 'Invalid birthDate format', { birthDate });
+      }
+    }
+    
     user.updatedAt = new Date();
 
     await user.save();
@@ -455,10 +499,13 @@ app.post('/user/:userId/update', async (req, res) => {
       user: {
         userId: user.userId,
         userName: user.userName,
+        email: user.email,
         gender: user.gender,
         country: user.country,
         avatarColor: user.avatarColor,
         profileImageUrl: user.profileImageUrl,
+        birthDate: user.birthDate,
+        authType: user.authType,
       },
     }, 'User profile updated successfully');
   } catch (err) {
@@ -560,7 +607,6 @@ const starCounts = new Map(); // key -> number (roomId or matchId)
 const oneTimeGifts = new Set(); // `${socketId}:${key}` to prevent duplicate gifts
 
 // ========== REPORTING & BLOCKING SYSTEM ==========
-const reportedUsers = new Map(); // userId -> { reports: { reporterId: timestamp }, blockedUntil: timestamp }
 const REPORT_CONFIG = {
   reportWindowMs: 24 * 60 * 60 * 1000,    // 24 hours
   
@@ -689,62 +735,6 @@ async function recordReport(reportedUserId, reporterId, reason = 'User reported'
   } catch (err) {
     Logger.error('recordReport', 'Error recording report', err.message);
     return false;
-  }
-}
-
-// Manually block a user (by userId, for abuse prevention)
-async function blockUser(userId, duration = null, reason = 'Manual block') {
-  try {
-    Logger.info('blockUser', 'Blocking user', { userId, duration, reason });
-    
-    const blockedUntil = duration ? new Date(Date.now() + duration) : null;
-    
-    await BlockedUser.findOneAndUpdate(
-      { userId },
-      {
-        userId,
-        blockedByUserId: 'SYSTEM',
-        reason,
-        blockType: 'manual',
-        blockDuration: duration,
-        blockedUntil,
-      },
-      { upsert: true, new: true }
-    );
-    
-    Logger.info('blockUser', '✅ User blocked', { userId, blockedUntil });
-    return true;
-  } catch (err) {
-    Logger.error('blockUser', 'Error blocking user', err.message);
-    return false;
-  }
-}
-
-// Unblock a user
-async function unblockUser(userId) {
-  try {
-    await BlockedUser.deleteOne({ userId });
-    Logger.info('unblockUser', '✅ User unblocked', { userId });
-    return true;
-  } catch (err) {
-    Logger.error('unblockUser', 'Error unblocking user', err.message);
-    return false;
-  }
-}
-
-// Update user stats in MongoDB
-async function updateUserStats(userId, likeCount, starCount) {
-  try {
-    await User.findOneAndUpdate(
-      { userId },
-      {
-        likeCount: likeCount || 0,
-        starCount: starCount || 0,
-        updatedAt: new Date(),
-      }
-    );
-  } catch (err) {
-    Logger.error('updateUserStats', 'Error updating user stats', err.message);
   }
 }
 
@@ -1135,6 +1125,8 @@ function broadcastStats() {
 
 // ========== GROUP CHAT ROOMS ==========
 const groupChatRooms = new Map(); // roomName -> Set of socketIds
+const messageIdCache = new Map(); // groupName -> { ids: Set, timestamp }
+const MESSAGE_CACHE_TIMEOUT = 30000; // 30 seconds
 
 // ========== SOCKET.IO CONNECTION HANDLER ==========
 io.on('connection', (socket) => {
@@ -2184,19 +2176,7 @@ io.on('connection', (socket) => {
 
   // ========== GROUP CHAT EVENTS ==========
   
-  // Message deduplication: track recent messageIds to prevent duplicates
-  const messageIdCache = new Map(); // groupName -> { ids: Set, timestamp }
-  const MESSAGE_CACHE_TIMEOUT = 30000; // 30 seconds
-  
-  // Clean old message IDs from cache periodically
-  setInterval(() => {
-    const now = Date.now();
-    for (const [groupName, cache] of messageIdCache.entries()) {
-      if (cache.timestamp && now - cache.timestamp > MESSAGE_CACHE_TIMEOUT) {
-        messageIdCache.delete(groupName);
-      }
-    }
-  }, MESSAGE_CACHE_TIMEOUT);
+  // Message deduplication uses the shared global cache
   
   // ✅ NEW: Get group members list (for members dialog)
   socket.on('get_group_members', (data, callback) => {
@@ -2335,9 +2315,12 @@ io.on('connection', (socket) => {
         });
       }
 
+      const requestedGroupName = baseGroupName;
+
       // Send joiner the full member list
       socket.emit('group_members_list', {
         groupName,
+        requestedGroupName,
         members: allMembers,
         memberCount,
         timestamp: new Date().toISOString(),
@@ -2346,6 +2329,7 @@ io.on('connection', (socket) => {
       // Notify all users in group (including the new joiner) of new member with full data
       io.to(`group_${groupName}`).emit('user_joined_group', {
         groupName,
+        requestedGroupName,
         groupIcon: data?.groupIcon || '💬',
         groupId: data?.groupId || null,
         senderSocketId: socket.id,
@@ -2356,6 +2340,9 @@ io.on('connection', (socket) => {
         avatarColor: data?.avatarColor || '#128C7E',
         avatarLetter: data?.avatarLetter || 'U',
         memberCount,
+        capacity: CONFIG.GROUP_ROOM_CAPACITY || 10,
+        roomName: groupName,
+        allMembers: allMembers,
         timestamp: new Date().toISOString(),
       });
 
@@ -2364,6 +2351,7 @@ io.on('connection', (socket) => {
         callback({
           success: true,
           groupName,
+          requestedGroupName,
           memberCount,
           capacity: CONFIG.GROUP_ROOM_CAPACITY || 10,
           roomName: groupName,
@@ -2543,11 +2531,29 @@ io.on('connection', (socket) => {
 
       // Notify remaining users in group
       if (memberCount > 0) {
+        // Build updated member list for remaining users
+        const remainingMembers = [];
+        for (const memberSocketId of roomSet) {
+          const memberMeta = socketMetadata.get(memberSocketId) || {};
+          remainingMembers.push({
+            socketId: memberSocketId,
+            userId: memberMeta.userId || '',
+            userName: memberMeta.userName || 'Unknown User',
+            avatarColor: memberMeta.avatarColor || '#128C7E',
+            avatarLetter: memberMeta.avatarLetter || 'U',
+            profileImagePath: memberMeta.profileImagePath || null,
+            senderProfileImagePath: memberMeta.profileImagePath || null,
+          });
+        }
+
         io.to(`group_${groupName}`).emit('user_left_group', {
           groupName,
           userId: data?.userId || '',
           userName: (data?.userName || 'Unknown User').substring(0, 50),
           memberCount,
+          capacity: CONFIG.GROUP_ROOM_CAPACITY || 10,
+          roomName: groupName,
+          allMembers: remainingMembers,
           timestamp: Date.now(),
         });
       } else {
@@ -2623,6 +2629,13 @@ setInterval(() => {
           socketId: stalUser.socketId,
           waitedSeconds: Math.floor(waitedMs / 1000),
         });
+      }
+    }
+
+    // Clean stale group message ID caches
+    for (const [groupName, cache] of messageIdCache.entries()) {
+      if (cache.timestamp && now - cache.timestamp > MESSAGE_CACHE_TIMEOUT) {
+        messageIdCache.delete(groupName);
       }
     }
     

@@ -10,7 +10,7 @@ const { Logger } = require('./logger');
  * Consolidates validation logic used in create_room, join_room, etc.
  * @param {object} socket - Socket.io socket object
  * @param {object} socketMetadata - Map of socket.id -> metadata
- * @param {object} userSockets - Map of userId -> socket.id
+ * @param {object} userSockets - Map of userId -> socket.id+
  * @param {object} userData - User data to register
  * @param {function} broadcastStats - Function to broadcast updated stats
  * @returns {object|null} Metadata object if successful, null if failed
