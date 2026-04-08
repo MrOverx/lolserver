@@ -12,12 +12,16 @@
   "description": "OmegleLOL WebSocket Server with MongoDB Backend",
   "dependencies": {
     "express": "^5.2.1",
-    "nodemon": "^3.1.11",
     "socket.io": "^4.8.3",
     "mongoose": "^7.5.0",
-    "mongodb": "^5.9.0",
     "bcryptjs": "^2.4.3",
     "dotenv": "^16.3.1",
-    "cors": "^2.8.5"
+    "cors": "^2.8.5",
+    "compression": "^1.7.4",
+    "helmet": "^7.1.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.11"
   }
 }
+

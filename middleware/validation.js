@@ -111,7 +111,12 @@ function validateProfileUpdate(req, res, next) {
       country: country ? String(country).trim() : undefined,
       avatarColor: avatarColor ? String(avatarColor) : undefined,
       profileImageUrl: req.body.profileImageUrl ? String(req.body.profileImageUrl) : undefined,
+      profileImagePath: req.body.profileImagePath ? String(req.body.profileImagePath) : undefined,
       pictureName: req.body.pictureName ? String(req.body.pictureName) : undefined,
+      birthDate: req.body.birthDate ? String(req.body.birthDate).trim() : undefined,
+      email: req.body.email ? String(req.body.email).toLowerCase().trim() : undefined,
+      authType: req.body.authType ? String(req.body.authType).trim() : undefined,
+      isGuest: typeof req.body.isGuest === 'boolean' ? req.body.isGuest : undefined,
     };
 
     Logger.debug('validation', 'Profile update validated');

@@ -1,29 +1,136 @@
-require('dotenv').config(); // Load environment variables from .env file
+const fs = require('fs');
+const path = require('path');
+// Ensure the local backend node_modules folder is resolved even when the file
+// is launched from a different CWD (for example, running nodemon from the root).
+module.paths.unshift(path.join(__dirname, 'node_modules'));
+
+// Load environment variables from the nearest .env file in the backend or workspace root.
+const envCandidates = [
+  path.resolve(__dirname, '.env'),
+  path.resolve(__dirname, '..', '.env'),
+  path.resolve(__dirname, '..', '..', '.env'),
+];
+let envPathUsed = null;
+for (const envPath of envCandidates) {
+  if (fs.existsSync(envPath)) {
+    require('dotenv').config({ path: envPath });
+    envPathUsed = envPath;
+    break;
+  }
+}
+if (!envPathUsed) {
+  require('dotenv').config();
+}
+
+if (envPathUsed) {
+  console.log(`🔐 Loaded environment variables from: ${envPathUsed}`);
+} else {
+  console.log('⚠️ No .env found in backend search paths; relying on process environment only');
+}
+
 const express = require('express');
 const http = require('http');
+const https = require('https');
 const socketIO = require('socket.io');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
+const compression = require('compression');
+const helmet = require('helmet');
+
+async function fetchGoogleTokenInfo(idToken) {
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: 'www.googleapis.com',
+      path: `/oauth2/v3/tokeninfo?id_token=${encodeURIComponent(idToken)}`,
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json',
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let body = '';
+      res.on('data', (chunk) => {
+        body += chunk;
+      });
+      res.on('end', () => {
+        try {
+          const tokenData = JSON.parse(body);
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            resolve(tokenData);
+          } else {
+            const error = new Error(`Google token validation failed: ${res.statusCode}`);
+            error.statusCode = res.statusCode;
+            error.responseBody = tokenData;
+            reject(error);
+          }
+        } catch (parseErr) {
+          reject(parseErr);
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+// Google OAuth configuration
+const DEFAULT_GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '638788559518-has2jchutlob4bj1cud789u2vjs13pkv.apps.googleusercontent.com';
+const configuredGoogleClientIds = process.env.GOOGLE_CLIENT_IDS
+  ? process.env.GOOGLE_CLIENT_IDS.split(',').map(id => id.trim()).filter(Boolean)
+  : [];
+const GOOGLE_CLIENT_IDS = Array.from(
+  new Set([
+    ...(process.env.GOOGLE_CLIENT_ID ? [process.env.GOOGLE_CLIENT_ID.trim()] : []),
+    ...configuredGoogleClientIds,
+    DEFAULT_GOOGLE_CLIENT_ID,
+  ])
+);
 
 // ✅ Import optimization utilities
 const { Logger } = require('./utils/logger');
 const { sendError, sendSuccess } = require('./utils/responseHandler');
 const { validateUserData } = require('./utils/userRegistration');
+const cors = require('cors');
 
 // ✅ Import enhancement middleware
-const { validateAuth, validateRegistration } = require('./middleware/validation');
+const { validateAuth, validateRegistration, validateProfileUpdate } = require('./middleware/validation');
 const { globalRateLimit, createRateLimiter, startCleanupInterval } = require('./middleware/rateLimiter');
 const { errorHandler, notFoundHandler, asyncHandler } = require('./middleware/errorHandler');
 
 // ✅ Import enhancement utilities
 const health = require('./utils/health');
 
+// Set log level based on environment
+Logger.setLevel(process.env.NODE_ENV === 'development' ? Logger.LOG_LEVELS.DEBUG : Logger.LOG_LEVELS.INFO);
+
 const app = express();
 const server = http.createServer(app);
 
-// ✅ Add JSON parsing middleware
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',').map(origin => origin.trim()).filter(Boolean)
+  : ['*'];
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    if (!origin || ALLOWED_ORIGINS.includes('*') || ALLOWED_ORIGINS.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('CORS policy: Origin not allowed'));
+    }
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+};
+
+// ✅ Add JSON parsing middleware with compression
+app.use(compression()); // ✅ Gzip compression for all responses
+app.use(helmet()); // ✅ Security headers (X-Frame-Options, Content-Security-Policy, etc.)
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(cors(corsOptions));
 
 // ✅ Register global middleware (BEFORE routes)
 app.use(globalRateLimit);
@@ -49,46 +156,77 @@ startCleanupInterval();
 
 // ========== MONGODB CONNECTION CONSTANTS ==========
 // 🔐 MongoDB Atlas Connection String (from environment variable)
-// Format: mongodb+srv://username:password@cluster.mongodb.net/?appName=databaseName
+// Format: mongodb+srv://username:password@cluster.mongodb.net/databaseName?options
+const MONGODB_URI = process.env.MONGODB_URI;
+
+if (!MONGODB_URI) {
+  console.error('❌ MONGODB_URI is not configured. Set it in .env or environment variables.');
+  process.exit(1);
+}
+
+const dbNameMatch = MONGODB_URI.match(/^[^\/]+\/([^?]+)(\?|$)/);
+const configuredDb = dbNameMatch ? dbNameMatch[1] : null;
+if (!configuredDb) {
+  console.error('❌ MongoDB URI does not include a database name. This backend requires a target database.');
+  console.error('   Expected URI like: mongodb+srv://user:password@cluster.mongodb.net/lolcluster?retryWrites=true&w=majority');
+  process.exit(1);
+}
+if (configuredDb !== 'lolcluster') {
+  console.warn(`⚠️ MongoDB URI uses database '${configuredDb}'. Confirm this is the intended target.`);
+}
+
+console.log(`🔐 MongoDB URI loaded and targeting database: ${configuredDb}`);
+
 const MONGODB_CONFIG = {
-  // Primary connection URI from environment or fallback to lolcluster
-  URI: process.env.MONGODB_URI || 'mongodb+srv://overx:ankit5639@lolcluster.68fu58k.mongodb.net/lolcluster?appName=lolcluster',
-  
-  // Connection options for optimal performance and frontend compatibility
+  URI: MONGODB_URI,
   options: {
     useNewUrlParser: true,
     useUnifiedTopology: true,
-    // Connection pooling for better performance
     maxPoolSize: 10,
     minPoolSize: 2,
-    // Timeouts
     socketTimeoutMS: 45000,
     serverSelectionTimeoutMS: 5000,
     connectTimeoutMS: 10000,
-    // Retries
     retryWrites: true,
     retryReads: true,
-    // Write concern for data reliability
     writeConcern: { w: 'majority' },
   },
 };
 
+const isDatabaseConnected = () => mongoose.connection.readyState === 1;
+let serverStarted = false;
+
+function startServer() {
+  if (serverStarted) return;
+  serverStarted = true;
+  server.listen(CONFIG.PORT, CONFIG.SERVER_BIND, () => {
+    Logger.info('startup', `WebSocket server listening`, {
+      bind: CONFIG.SERVER_BIND,
+      advertisedIP: CONFIG.SERVER_IP,
+      port: CONFIG.PORT,
+    });
+  });
+}
+
 // ========== MONGODB CONNECTION ==========
+const safeMongoUri = MONGODB_CONFIG.URI.replace(/^(mongodb(?:\+srv)?:\/\/)([^@]+@)?/, '$1****@');
 console.log('🔄 Connecting to MongoDB...');
-console.log(`📍 Database: ${MONGODB_CONFIG.URI.split('/').pop()}`);
+console.log(`📍 MongoDB Host: ${safeMongoUri}`);
 
 mongoose.connect(MONGODB_CONFIG.URI, MONGODB_CONFIG.options)
   .then(() => {
-    console.log('✅ Connected to MongoDB Atlas Successfully!');
-    Logger.info('mongodb', '✅ Connected to MongoDB Atlas', {
-      database: MONGODB_CONFIG.URI.split('/').pop(),
+    console.log('✅ Connected to MongoDB successfully!');
+    Logger.info('mongodb', '✅ Connected to MongoDB', {
+      uri: safeMongoUri,
       timestamp: new Date().toISOString(),
     });
+    health.setDbConnected(true);
+    startServer();
   })
   .catch(err => {
     console.error('❌ MongoDB connection error:', err.message);
     Logger.error('mongodb', '❌ MongoDB connection error', err.message);
-    // Don't exit - allow server to start and attempt reconnection
+    health.setDbConnected(false);
     setTimeout(() => {
       console.log('🔄 Attempting MongoDB reconnection...');
       mongoose.connect(MONGODB_CONFIG.URI, MONGODB_CONFIG.options);
@@ -98,17 +236,19 @@ mongoose.connect(MONGODB_CONFIG.URI, MONGODB_CONFIG.options)
 // Handle MongoDB connection events
 mongoose.connection.on('disconnected', () => {
   Logger.warn('mongodb', '⚠️ Disconnected from MongoDB');
+  health.setDbConnected(false);
 });
 
 mongoose.connection.on('error', (err) => {
   Logger.error('mongodb', '❌ MongoDB error', err.message);
+  health.setDbConnected(false);
 });
 
 
 // Configure CORS for socket.io
 const io = socketIO(server, {
   cors: {
-    origin: '*',
+    origin: ALLOWED_ORIGINS.includes('*') ? '*' : ALLOWED_ORIGINS,
     methods: ['GET', 'POST'],
   },
   // Allow polling fallback for environments where pure websocket may fail
@@ -121,21 +261,21 @@ const io = socketIO(server, {
 
 // User Schema
 const userSchema = new mongoose.Schema({
-  userId: { type: String, unique: true, required: true },
-  userName: { type: String, required: true },
-  email: { type: String, unique: true, sparse: true },
-  authType: { type: String, enum: ['GOOGLE_OAUTH', 'LOCAL', 'GUEST'], default: 'LOCAL' },
-  isGuest: { type: Boolean, default: false },
+  userId: { type: String, unique: true, required: true, index: true },
+  userName: { type: String, required: true, index: true },
+  email: { type: String, unique: true, sparse: true, index: true, lowercase: true },
+  authType: { type: String, enum: ['GOOGLE_OAUTH', 'LOCAL', 'GUEST'], default: 'LOCAL', index: true },
+  isGuest: { type: Boolean, default: false, index: true },
   
   // Profile Information
   gender: { type: String, enum: ['male', 'female', 'other'], default: 'other' },
-  country: { type: String, default: null },
+  country: { type: String, default: null, index: true },
   birthDate: { type: Date, default: null },
   
   // Avatar & Profile
   avatarColor: { type: String, default: '#128C7E' },
   avatarLetter: { type: String, default: 'U' },
-  profileImageUrl: { type: String, default: null }, // ✅ URL only (from Google or external)
+  profileImageUrl: { type: String, default: null },
   useColorProfile: { type: Boolean, default: true },
   pictureName: { type: String, default: null },
   
@@ -145,24 +285,34 @@ const userSchema = new mongoose.Schema({
   starCount: { type: Number, default: 0 },
   
   // Account Status
-  isActive: { type: Boolean, default: true },
-  createdAt: { type: Date, default: Date.now },
-  updatedAt: { type: Date, default: Date.now },
-  lastLogin: { type: Date, default: null },
+  isActive: { type: Boolean, default: true, index: true },
+  createdAt: { type: Date, default: Date.now, index: true },
+  updatedAt: { type: Date, default: Date.now, index: true },
+  lastLogin: { type: Date, default: null, index: true },
 });
+
+// ✅ Create compound indexes for common query patterns
+userSchema.index({ isActive: 1, createdAt: -1 }); // Get active users by creation date
+userSchema.index({ country: 1, isActive: 1 }); // Find users by country
+userSchema.index({ authType: 1, isActive: 1 }); // Auth type filtering
+userSchema.index({ email: 1, isGuest: 1 }); // Email lookups
 
 // Blocked Users Schema (tracks blocks and time-based unblocks)
 const blockedUserSchema = new mongoose.Schema({
-  userId: { type: String, required: true },
-  blockedByUserId: { type: String, required: true }, // Who blocked this user
+  userId: { type: String, required: true, index: true },
+  blockedByUserId: { type: String, required: true, index: true },
   reason: { type: String, default: 'User reported' },
   blockType: { type: String, enum: ['report', 'manual'], default: 'report' },
-  blockDuration: { type: Number, default: null }, // milliseconds (null = permanent)
-  blockedUntil: { type: Date, default: null }, // When this block expires
-  reportCount: { type: Number, default: 1 }, // How many reports led to this block
-  reporters: { type: [String], default: [] }, // List of reporter IDs
+  blockDuration: { type: Number, default: null },
+  blockedUntil: { type: Date, default: null, index: true }, // TTL cleanup query
+  reportCount: { type: Number, default: 1 },
+  reporters: { type: [String], default: [] },
   createdAt: { type: Date, default: Date.now },
 });
+
+// ✅ Compound index for block lookups
+blockedUserSchema.index({ userId: 1, blockedByUserId: 1 }, { unique: true });
+blockedUserSchema.index({ blockedUntil: 1 }, { sparse: true }); // Sparse index for TTL
 
 // Report History Schema (tracks all reports against a user)
 const reportSchema = new mongoose.Schema({
@@ -241,35 +391,67 @@ app.post('/auth/validate-token', validateTokenLimiter, asyncHandler(async (req, 
     }
 
     // Validate token with Google's API
-    const tokenResponse = await fetch('https://www.googleapis.com/oauth2/v3/tokeninfo', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ id_token: idToken }),
-    });
-
-    if (!tokenResponse.ok) {
+    let tokenData;
+    try {
+      tokenData = await fetchGoogleTokenInfo(idToken);
+    } catch (fetchErr) {
       Logger.warn(
         'oauth/validate',
-        `Token validation failed: ${tokenResponse.status}`,
-        { status: tokenResponse.status }
+        'Token validation failed',
+        {
+          message: fetchErr.message,
+          statusCode: fetchErr.statusCode,
+          responseBody: fetchErr.responseBody,
+        }
       );
       return sendError(res, 401, 'Invalid or expired token', 'INVALID_TOKEN');
     }
 
-    const tokenData = await tokenResponse.json();
+    if (!isDatabaseConnected()) {
+      return sendError(res, 503, 'Database not connected', 'DB_NOT_CONNECTED');
+    }
+
+    const tokenAudiences = Array.isArray(tokenData.aud) ? tokenData.aud : [tokenData.aud];
+    const tokenAuthorizedParty = tokenData.azp ? [tokenData.azp] : [];
+    const tokenIssuer = tokenData.iss;
+    const validIssuers = ['accounts.google.com', 'https://accounts.google.com'];
+
+    const validatedAudiences = Array.from(
+      new Set([
+        ...tokenAudiences.filter(Boolean),
+        ...tokenAuthorizedParty.filter(Boolean),
+      ])
+    );
+
+    const audienceMatches = validatedAudiences.some(aud => GOOGLE_CLIENT_IDS.includes(aud));
+    if (!audienceMatches) {
+      Logger.warn('oauth/validate', 'Google ID token audience mismatch', {
+        expected: GOOGLE_CLIENT_IDS,
+        actualAud: tokenData.aud,
+        actualAzp: tokenData.azp,
+      });
+      return sendError(res, 401, 'Invalid token audience', 'INVALID_TOKEN_AUDIENCE');
+    }
+
+    if (!validIssuers.includes(tokenIssuer)) {
+      Logger.warn('oauth/validate', 'Google ID token issuer invalid', {
+        issuer: tokenIssuer,
+      });
+      return sendError(res, 401, 'Invalid token issuer', 'INVALID_TOKEN_ISSUER');
+    }
 
     Logger.info('oauth/validate', '✅ Token validated successfully', {
       userId: tokenData.sub,
-      email: tokenData.email,
       emailVerified: tokenData.email_verified,
     });
 
     // ✅ Save or update user in MongoDB after Google validation
     const userId = tokenData.sub;
+    console.log('🔍 Token data sub:', tokenData.sub, 'type:', typeof tokenData.sub);
     const userParams = {
       userId,
-      email: tokenData.email,
       userName: userMeta?.displayName || tokenData.name || 'User',
+      email: tokenData.email || userMeta?.email || null,
       authType: 'GOOGLE_OAUTH',
       isGuest: false,
       profileImageUrl: tokenData.picture || userMeta?.photoUrl || null,
@@ -277,33 +459,46 @@ app.post('/auth/validate-token', validateTokenLimiter, asyncHandler(async (req, 
       updatedAt: new Date(),
     };
 
-    let isExistingUser = false;
     let savedUser = null;
+    let isExistingUser = false;
 
     try {
-      const existingUser = await User.findOne({ userId });
-      if (existingUser) {
-        isExistingUser = true;
-        existingUser.userName = userParams.userName;
-        existingUser.email = userParams.email;
-        existingUser.authType = userParams.authType;
-        existingUser.isGuest = userParams.isGuest;
-        existingUser.profileImageUrl = userParams.profileImageUrl;
-        existingUser.lastLogin = userParams.lastLogin;
-        existingUser.updatedAt = userParams.updatedAt;
-        savedUser = await existingUser.save();
-      } else {
-        const newUser = new User({
-          ...userParams,
-          gender: 'other',
-          country: null,
-          avatarColor: '#128C7E',
-        });
-        savedUser = await newUser.save();
+      const updateData = {
+        userName: userParams.userName,
+        email: userParams.email,
+        authType: userParams.authType,
+        isGuest: userParams.isGuest,
+        profileImageUrl: userParams.profileImageUrl,
+        lastLogin: userParams.lastLogin,
+        updatedAt: userParams.updatedAt,
+      };
+
+      console.log('🔄 Attempting to save user to MongoDB:', { userId, updateData });
+
+      savedUser = await User.findOneAndUpdate(
+        { userId },
+        {
+          $set: updateData,
+          $setOnInsert: {
+            userId,
+            gender: 'other',
+            country: null,
+            avatarColor: '#128C7E',
+            createdAt: new Date(),
+          },
+        },
+        { upsert: true, new: true, lean: true, setDefaultsOnInsert: true }
+      );
+
+      console.log('✅ User saved/updated in MongoDB:', savedUser);
+
+      if (savedUser) {
+        isExistingUser = savedUser.createdAt < savedUser.updatedAt;
       }
 
-      Logger.info('oauth/validate', '✅ User saved/updated in MongoDB', { userId, isExistingUser });
+      Logger.info('oauth/validate', '✅ User saved/updated in MongoDB', { userId, isExistingUser, user: savedUser });
     } catch (dbErr) {
+      console.error('❌ Error saving user to MongoDB:', dbErr);
       Logger.error('oauth/validate', 'Error saving user to MongoDB', dbErr && dbErr.message);
       return sendError(res, 500, 'Database error while saving user', { details: dbErr.message });
     }
@@ -313,7 +508,6 @@ app.post('/auth/validate-token', validateTokenLimiter, asyncHandler(async (req, 
       user: savedUser ? {
         userId: savedUser.userId,
         userName: savedUser.userName,
-        email: savedUser.email,
         gender: savedUser.gender,
         country: savedUser.country,
         avatarColor: savedUser.avatarColor,
@@ -323,7 +517,6 @@ app.post('/auth/validate-token', validateTokenLimiter, asyncHandler(async (req, 
         lastLogin: savedUser.lastLogin,
       } : {
         id: tokenData.sub,
-        email: tokenData.email,
         emailVerified: tokenData.email_verified === 'true',
         name: tokenData.name,
         picture: tokenData.picture,
@@ -337,6 +530,9 @@ app.post('/auth/validate-token', validateTokenLimiter, asyncHandler(async (req, 
 
 // ========== NEW: REGISTER ENDPOINT ==========
 app.post('/auth/register', registerLimiter, validateRegistration, asyncHandler(async (req, res) => {
+  if (!isDatabaseConnected()) {
+    return sendError(res, 503, 'Database not connected', 'DB_NOT_CONNECTED');
+  }
   try {
     const { userId, userName, email, password, gender, country, avatarColor } = req.body;
 
@@ -388,6 +584,9 @@ app.post('/auth/register', registerLimiter, validateRegistration, asyncHandler(a
 
 // ========== NEW: LOGIN ENDPOINT ==========
 app.post('/auth/login', loginLimiter, validateAuth, asyncHandler(async (req, res) => {
+  if (!isDatabaseConnected()) {
+    return sendError(res, 503, 'Database not connected', 'DB_NOT_CONNECTED');
+  }
   try {
     const { userId, email, password } = req.body;
 
@@ -430,7 +629,23 @@ app.post('/auth/login', loginLimiter, validateAuth, asyncHandler(async (req, res
 }));
 
 // ========== NEW: GET USER PROFILE ENDPOINT ==========
+// DEBUG: List users for immediate verification
+app.get('/debug/users', async (req, res) => {
+  if (!isDatabaseConnected()) {
+    return sendError(res, 503, 'Database not connected', 'DB_NOT_CONNECTED');
+  }
+  try {
+    const users = await User.find({}).limit(30).lean();
+    return sendSuccess(res, { users }, 'Debug: list user documents');
+  } catch (err) {
+    return sendError(res, 500, 'Debug query failed', { details: err.message });
+  }
+});
+
 app.get('/user/:userId', async (req, res) => {
+  if (!isDatabaseConnected()) {
+    return sendError(res, 503, 'Database not connected', 'DB_NOT_CONNECTED');
+  }
   try {
     const { userId } = req.params;
 
@@ -459,41 +674,162 @@ app.get('/user/:userId', async (req, res) => {
   }
 });
 
-// ========== NEW: UPDATE USER PROFILE ENDPOINT ==========
-app.post('/user/:userId/update', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { userName, gender, country, avatarColor, profileImageUrl, profileImagePath, pictureName, birthDate } = req.body;
+// ========== NEW: SEARCH USERS ENDPOINT ==========
+app.get('/users/search', async (req, res) => {
+  if (!isDatabaseConnected()) {
+    return sendError(res, 503, 'Database not connected', 'DB_NOT_CONNECTED');
+  }
 
-    const user = await User.findOne({ userId });
-    if (!user) {
-      return sendError(res, 404, 'User not found', 'USER_NOT_FOUND');
+  try {
+    const queryValue = req.query.q;
+    const searchText = Array.isArray(queryValue)
+      ? String(queryValue[0]).trim()
+      : String(queryValue ?? '').trim();
+
+    if (!searchText) {
+      return sendError(res, 400, 'Search query is required', 'VALIDATION_ERROR');
     }
 
-    // Update fields
-    if (userName) user.userName = userName;
-    if (gender) user.gender = gender;
-    if (country) user.country = country;
-    if (avatarColor) user.avatarColor = avatarColor;
-    
-    // Handle both profileImageUrl and profileImagePath (frontend may send either)
-    if (profileImageUrl) user.profileImageUrl = profileImageUrl;
-    if (profileImagePath) user.profileImageUrl = profileImagePath;
-    
-    if (pictureName) user.pictureName = pictureName;
+    const escaped = searchText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const fuzzyRegex = new RegExp(escaped, 'i');
+
+    const users = await User.find({
+      isActive: true,
+      $or: [
+        { userName: fuzzyRegex },
+        { userId: fuzzyRegex },
+        { email: fuzzyRegex },
+      ],
+    })
+      .sort({ createdAt: -1 })
+      .limit(25)
+      .lean();
+
+    return res.status(200).json(users.map((user) => ({
+      userId: user.userId,
+      userName: user.userName,
+      email: user.email,
+      gender: user.gender,
+      country: user.country,
+      avatarColor: user.avatarColor,
+      profileImageUrl: user.profileImageUrl,
+    })));
+
+  } catch (err) {
+    Logger.error('users/search', 'Error searching users', err.message);
+    return sendError(res, 500, 'Error searching users', { details: err.message });
+  }
+});
+
+const VALID_GENDERS = ['male', 'female', 'other'];
+
+function sanitizeGenderInput(genderValue) {
+  if (!genderValue || typeof genderValue !== 'string') {
+    return null;
+  }
+
+  const normalized = String(genderValue).trim().toLowerCase();
+  if (VALID_GENDERS.includes(normalized)) {
+    return normalized;
+  }
+
+  if (normalized.startsWith('gender.')) {
+    const candidate = normalized.substring('gender.'.length);
+    if (VALID_GENDERS.includes(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+// ========== NEW: UPDATE USER PROFILE ENDPOINT ==========
+app.post('/user/:userId/update', validateProfileUpdate, async (req, res) => {
+  if (!isDatabaseConnected()) {
+    return sendError(res, 503, 'Database not connected', 'DB_NOT_CONNECTED');
+  }
+  try {
+    const { userId } = req.params;
+    const { userName, email, gender, country, avatarColor, profileImageUrl, profileImagePath, pictureName, birthDate, authType, isGuest } = req.body;
+
+    Logger.info('user/update', 'Received profile update payload', {
+      userId,
+      userName,
+      email,
+      gender,
+      country,
+      avatarColor,
+      profileImageUrl,
+      profileImagePath,
+      pictureName,
+      birthDate,
+      authType,
+      isGuest,
+    });
+
+    const updateData = {
+      updatedAt: new Date(),
+    };
+
+    if (userName) updateData.userName = String(userName).trim();
+
+    const normalizedGender = sanitizeGenderInput(gender);
+    if (normalizedGender) {
+      updateData.gender = normalizedGender;
+    } else if (gender != null) {
+      Logger.warn('user/update', 'Invalid gender value ignored', { userId, gender });
+    }
+
+    if (country) updateData.country = String(country).trim();
+    if (avatarColor) updateData.avatarColor = String(avatarColor).trim();
+    if (profileImageUrl) {
+      updateData.profileImageUrl = String(profileImageUrl).trim();
+    } else if (profileImagePath) {
+      Logger.warn(
+        'user/update',
+        'profileImagePath provided but ignored to prevent local file upload to MongoDB',
+        { userId, profileImagePath }
+      );
+    }
+    if (pictureName) updateData.pictureName = String(pictureName).trim();
+    if (email) updateData.email = String(email).toLowerCase().trim();
+    if (authType) updateData.authType = String(authType).trim();
+    if (typeof isGuest === 'boolean') updateData.isGuest = isGuest;
     if (birthDate) {
       try {
-        user.birthDate = new Date(birthDate);
+        updateData.birthDate = new Date(String(birthDate));
       } catch (e) {
         Logger.warn('user/update', 'Invalid birthDate format', { birthDate });
       }
     }
-    
-    user.updatedAt = new Date();
 
-    await user.save();
+    const safeFields = ['email', 'userName', 'gender', 'country', 'avatarColor', 'profileImageUrl', 'pictureName', 'birthDate', 'authType', 'isGuest', 'updatedAt'];
+    const safeUpdateData = {};
+    for (const key of safeFields) {
+      if (Object.prototype.hasOwnProperty.call(updateData, key)) {
+        safeUpdateData[key] = updateData[key];
+      }
+    }
 
-    Logger.info('user/update', '✅ User profile updated', { userId });
+    const user = await User.findOneAndUpdate(
+      { userId },
+      {
+        $set: safeUpdateData,
+        $setOnInsert: {
+          userId,
+          createdAt: new Date(),
+          authType: 'GOOGLE_OAUTH',
+          isGuest: false,
+        },
+      },
+      { upsert: true, new: true, lean: true, setDefaultsOnInsert: true }
+    );
+
+    Logger.info('user/update', '✅ User profile updated or created', {
+      userId,
+      created: user.createdAt.getTime() === user.updatedAt.getTime(),
+      user,
+    });
 
     return sendSuccess(res, {
       user: {
@@ -517,8 +853,10 @@ app.post('/user/:userId/update', async (req, res) => {
 // ========== CONFIGURATION ==========
 const CONFIG = {
   PORT: process.env.PORT || 8080,
-  SERVER_IP: process.env.SERVER_IP || '127.0.0.1', // Local default address
-  // Host/interface to bind the HTTP server to (defaults to all interfaces)
+  // ✅ For development: Use 0.0.0.0 (accessible from Android emulator at 10.0.2.2)
+  // For production: Set SERVER_IP env var to public IP
+  SERVER_IP: process.env.SERVER_IP || 'localhost',
+  // Host/interface to bind the HTTP server to (defaults to all interfaces for emulator access)
   SERVER_BIND: process.env.SERVER_BIND || '0.0.0.0',
   STALE_TIMEOUT: 5 * 60 * 1000, // 5 minutes
   CLEANUP_INTERVAL: 60 * 1000, // 60 seconds
@@ -760,23 +1098,6 @@ function checkRateLimit(socketId) {
   limit.count++;
   return true;
 }
-
-// ========== HEALTH CHECK ENDPOINT ==========
-app.get('/health', (req, res) => {
-  try {
-    res.json({
-      status: 'ok',
-      timestamp: new Date().toISOString(),
-      videoQueueSize: videoQueue.length,
-      chatQueueSize: chatQueue.length,
-      activePairings: videoPairings.size + chatPairings.size,
-      totalConnected: socketMetadata.size,
-    });
-  } catch (error) {
-    Logger.error('health', 'Error generating health check', error.message);
-    res.status(500).json({ status: 'error', message: 'Internal server error' });
-  }
-});
 
 // ========== VALIDATION & UTILITIES ==========
 function isValidSocketId(socketId) {
@@ -1131,6 +1452,7 @@ const MESSAGE_CACHE_TIMEOUT = 30000; // 30 seconds
 // ========== SOCKET.IO CONNECTION HANDLER ==========
 io.on('connection', (socket) => {
   Logger.info('connection', 'Client connected', { socketId: socket.id });
+  health.updateSocketConnections(io.of('/').sockets.size);
 
   socket.emit('SignallingClient', socket.id);
 
@@ -2167,6 +2489,7 @@ io.on('connection', (socket) => {
       }
       socketMetadata.delete(socket.id);
       socketQueues.delete(socket.id);
+      health.updateSocketConnections(io.of('/').sockets.size);
 
       broadcastStats();
     } catch (error) {
@@ -2654,37 +2977,120 @@ setInterval(() => {
   }
 }, 5000);
 
-// ✅ Register not found handler (BEFORE error handler)
+// ✅ Register 404 and error handlers (MUST be LAST)
 app.use(notFoundHandler);
-
-// ✅ Register error handler (MUST be LAST)
 app.use(errorHandler);
 
 // ========== SERVER STARTUP ==========
-server.listen(CONFIG.PORT, CONFIG.SERVER_BIND, () => {
-  Logger.info('startup', `WebSocket server listening`, {
-    bind: CONFIG.SERVER_BIND,
-    advertisedIP: CONFIG.SERVER_IP,
-    port: CONFIG.PORT,
-  });
-});
+// The server starts automatically once MongoDB is connected.
+// This prevents accepting requests before the database is available.
 
 // ========== GRACEFUL SHUTDOWN ==========
-process.on('SIGTERM', () => {
-  Logger.info('shutdown', 'SIGTERM received, closing server...');
-  server.close(() => {
-    Logger.info('shutdown', 'Server closed');
-    process.exit(0);
-  });
-});
+// Handle graceful shutdown on SIGTERM/SIGINT (production standard signals)
+let isShuttingDown = false;
 
-process.on('SIGINT', () => {
-  Logger.info('shutdown', 'SIGINT received, closing server...');
-  server.close(() => {
-    Logger.info('shutdown', 'Server closed');
-    process.exit(0);
+const gracefulShutdown = async (signal) => {
+  if (isShuttingDown) {
+    Logger.warn('shutdown', 'Shutdown already in progress, ignoring signal', { signal });
+    return;
+  }
+
+  isShuttingDown = true;
+  Logger.info('shutdown', `${signal} received, initiating graceful shutdown...`, {
+    signal,
+    timestamp: new Date().toISOString(),
+    activeConnections: io.of('/').sockets.size,
   });
-});
+
+  try {
+    // ✅ Step 1: Stop accepting new connections
+    server.close(async () => {
+      Logger.info('shutdown', 'HTTP server closed, no new connections accepted');
+    });
+
+    // ✅ Step 2: Disconnect all Socket.IO clients gracefully
+    Logger.info('shutdown', 'Disconnecting Socket.IO clients...', {
+      activeConnections: io.of('/').sockets.size,
+    });
+    
+    const sockets = io.of('/').sockets;
+    for (const [socketId, socket] of sockets) {
+      try {
+        socket.disconnect(true); // Force disconnect with reconnection disabled
+      } catch (err) {
+        Logger.warn('shutdown', 'Error disconnecting socket', {
+          socketId,
+          error: err.message,
+        });
+      }
+    }
+    Logger.info('shutdown', 'Socket.IO clients disconnected');
+
+    // ✅ Step 3: Stop health monitoring
+    if (health && health.stopMonitoring) {
+      try {
+        health.stopMonitoring();
+        Logger.info('shutdown', 'Health monitoring stopped');
+      } catch (err) {
+        Logger.warn('shutdown', 'Error stopping health monitoring', { error: err.message });
+      }
+    }
+
+    // ✅ Step 4: Close MongoDB connection gracefully
+    Logger.info('shutdown', 'Closing MongoDB connection...');
+    if (mongoose.connection && mongoose.connection.db) {
+      try {
+        await mongoose.connection.close();
+        Logger.info('shutdown', 'MongoDB connection closed gracefully');
+      } catch (err) {
+        Logger.warn('shutdown', 'Error closing MongoDB', { error: err.message });
+      }
+    }
+
+    // ✅ Step 5: Clear in-memory state
+    Logger.info('shutdown', 'Clearing in-memory state...', {
+      videoPairings: videoPairings.size,
+      chatPairings: chatPairings.size,
+      videoQueue: videoQueue.length,
+      chatQueue: chatQueue.length,
+      groupRooms: groupChatRooms.size,
+      socketMetadata: socketMetadata.size,
+    });
+    
+    videoPairings.clear();
+    chatPairings.clear();
+    videoQueue.length = 0;
+    chatQueue.length = 0;
+    rooms.clear();
+    groupChatRooms.clear();
+    socketMetadata.clear();
+    userSockets.clear();
+    socketQueues.clear();
+    rateLimitMap.clear();
+    userGenderPreferences.clear();
+
+    Logger.info('shutdown', '✅ Graceful shutdown completed successfully', {
+      signal,
+      uptime: process.uptime(),
+      timestamp: new Date().toISOString(),
+    });
+
+    process.exit(0);
+  } catch (err) {
+    Logger.error('shutdown', 'Error during graceful shutdown', {
+      signal,
+      error: err.message,
+      stack: err.stack,
+    });
+    process.exit(1);
+  }
+};
+
+// Handle SIGTERM (production termination signal)
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+
+// Handle SIGINT (Ctrl+C in development)
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 // ========== ERROR HANDLING ==========
 process.on('uncaughtException', (error) => {
