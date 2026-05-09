@@ -271,6 +271,7 @@ const userSchema = new mongoose.Schema({
   gender: { type: String, enum: ['male', 'female', 'other'], default: 'other' },
   country: { type: String, default: null, index: true },
   birthDate: { type: Date, default: null },
+  profileComplete: { type: Boolean, default: false, index: true }, // ✅ Track if user completed profile setup
   
   // Avatar & Profile
   avatarColor: { type: String, default: '#128C7E' },
@@ -279,10 +280,8 @@ const userSchema = new mongoose.Schema({
   useColorProfile: { type: Boolean, default: true },
   pictureName: { type: String, default: null },
   
-  // Social Stats
-  likeCount: { type: Number, default: 0 },
-  likedUserIds: { type: [String], default: [] },
-  starCount: { type: Number, default: 0 },
+  // Stats & achievements
+  xp: { type: Map, of: Number, default: {} },
   
   // Account Status
   isActive: { type: Boolean, default: true, index: true },
@@ -296,6 +295,18 @@ userSchema.index({ isActive: 1, createdAt: -1 }); // Get active users by creatio
 userSchema.index({ country: 1, isActive: 1 }); // Find users by country
 userSchema.index({ authType: 1, isActive: 1 }); // Auth type filtering
 userSchema.index({ email: 1, isGuest: 1 }); // Email lookups
+
+// ✅ Helper function to normalize xp output (handles legacy starCount fallback)
+function getUserXp(user) {
+  if (!user) return {};
+  if (user.xp && typeof user.xp === 'object') {
+    return user.xp;
+  }
+  if (user.starCount != null) {
+    return { total: Number(user.starCount) || 0 };
+  }
+  return {};
+}
 
 // Blocked Users Schema (tracks blocks and time-based unblocks)
 const blockedUserSchema = new mongoose.Schema({
@@ -322,10 +333,23 @@ const reportSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now, expires: 86400 }, // Auto-delete after 24 hours
 });
 
+// ✅ NEW: Friends Schema (tracks friend relationships)
+const friendSchema = new mongoose.Schema({
+  userId: { type: String, required: true, index: true },
+  friendId: { type: String, required: true, index: true },
+  status: { type: String, enum: ['pending', 'accepted'], default: 'accepted' },
+  createdAt: { type: Date, default: Date.now, index: true },
+});
+
+// Compound index for friend lookups
+friendSchema.index({ userId: 1, friendId: 1 }, { unique: true });
+friendSchema.index({ friendId: 1, userId: 1 });
+
 // Create Models
 const User = mongoose.model('User', userSchema);
 const BlockedUser = mongoose.model('BlockedUser', blockedUserSchema);
 const Report = mongoose.model('Report', reportSchema);
+const Friend = mongoose.model('Friend', friendSchema);
 
 // Simple lookup endpoint to help debug join-by-invite behavior from clients
 app.get('/room/by-invite/:code', (req, res) => {
@@ -463,6 +487,17 @@ app.post('/auth/validate-token', validateTokenLimiter, asyncHandler(async (req, 
     let isExistingUser = false;
 
     try {
+      // ✅ STEP 1: Check if email ALREADY EXISTS before upserting
+      // This is the primary way to determine if user is returning or new
+      let emailExists = false;
+      const userEmail = userParams.email?.toLowerCase();
+      
+      if (userEmail) {
+        const existingByEmail = await User.findOne({ email: userEmail }).lean();
+        emailExists = !!existingByEmail;
+        console.log('🔍 Email existence check:', { email: userEmail, exists: emailExists });
+      }
+
       const updateData = {
         userName: userParams.userName,
         email: userParams.email,
@@ -475,6 +510,7 @@ app.post('/auth/validate-token', validateTokenLimiter, asyncHandler(async (req, 
 
       console.log('🔄 Attempting to save user to MongoDB:', { userId, updateData });
 
+      // ✅ STEP 2: Update or create the user
       savedUser = await User.findOneAndUpdate(
         { userId },
         {
@@ -492,8 +528,20 @@ app.post('/auth/validate-token', validateTokenLimiter, asyncHandler(async (req, 
 
       console.log('✅ User saved/updated in MongoDB:', savedUser);
 
+      // ✅ STEP 3: Determine if user is existing based on email
+      // An "existing user" is one whose email was ALREADY in the system
+      // This is more reliable than checking profile completion
+      isExistingUser = emailExists;
+
       if (savedUser) {
-        isExistingUser = savedUser.createdAt < savedUser.updatedAt;
+        Logger.info('oauth/validate', `User existence check for ${userId}`, {
+          email: userEmail,
+          emailExisted: emailExists,
+          profileComplete: savedUser.profileComplete,
+          gender: savedUser.gender,
+          country: savedUser.country,
+          isExisting: isExistingUser,
+        });
       }
 
       Logger.info('oauth/validate', '✅ User saved/updated in MongoDB', { userId, isExistingUser, user: savedUser });
@@ -512,6 +560,8 @@ app.post('/auth/validate-token', validateTokenLimiter, asyncHandler(async (req, 
         country: savedUser.country,
         avatarColor: savedUser.avatarColor,
         profileImageUrl: savedUser.profileImageUrl,
+        profileComplete: savedUser.profileComplete || false, // ✅ NEW: Include profileComplete flag
+        xp: getUserXp(savedUser),
         authType: savedUser.authType,
         isGuest: savedUser.isGuest,
         lastLogin: savedUser.lastLogin,
@@ -618,8 +668,7 @@ app.post('/auth/login', loginLimiter, validateAuth, asyncHandler(async (req, res
         country: user.country,
         avatarColor: user.avatarColor,
         profileImageUrl: user.profileImageUrl,
-        likeCount: user.likeCount,
-        starCount: user.starCount,
+        xp: getUserXp(user),
       },
     }, 'Login successful');
   } catch (err) {
@@ -663,8 +712,7 @@ app.get('/user/:userId', async (req, res) => {
         country: user.country,
         avatarColor: user.avatarColor,
         profileImageUrl: user.profileImageUrl,
-        likeCount: user.likeCount,
-        starCount: user.starCount,
+        xp: getUserXp(user),
         createdAt: user.createdAt,
       },
     });
@@ -690,11 +738,13 @@ app.get('/users/search', async (req, res) => {
       return sendError(res, 400, 'Search query is required', 'VALIDATION_ERROR');
     }
 
+    // ✅ FIXED: Create case-insensitive regex for fuzzy search
     const escaped = searchText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const fuzzyRegex = new RegExp(escaped, 'i');
 
+    // ✅ IMPROVED: Search without isActive filter for better results
+    // Include users even if isActive is not set or false (for compatibility with old data)
     const users = await User.find({
-      isActive: true,
       $or: [
         { userName: fuzzyRegex },
         { userId: fuzzyRegex },
@@ -705,6 +755,18 @@ app.get('/users/search', async (req, res) => {
       .limit(25)
       .lean();
 
+    Logger.info('users/search', `Search results: ${users.length} users found`, {
+      query: searchText,
+      count: users.length,
+    });
+
+    console.log('🔍 Search query:', searchText);
+    console.log('📊 Found users:', users.length);
+    if (users.length > 0) {
+      console.log('✅ First result:', users[0]);
+    }
+
+    // ✅ ENHANCED: Return all fields frontend needs
     return res.status(200).json(users.map((user) => ({
       userId: user.userId,
       userName: user.userName,
@@ -712,12 +774,281 @@ app.get('/users/search', async (req, res) => {
       gender: user.gender,
       country: user.country,
       avatarColor: user.avatarColor,
+      avatarLetter: (user.userName && user.userName.length > 0) 
+        ? user.userName.charAt(0).toUpperCase() 
+        : 'U',  // ✅ NEW: Add avatar letter for display
       profileImageUrl: user.profileImageUrl,
+      profileImagePath: user.profileImagePath,  // ✅ NEW: Include profile image path
+      isOnline: false,  // ✅ NEW: Add online status (users from search are not in active connections)
+      xp: getUserXp(user),
+      createdAt: user.createdAt,
+      lastLogin: user.lastLogin,
     })));
 
   } catch (err) {
     Logger.error('users/search', 'Error searching users', err.message);
+    console.error('❌ Search error details:', err);
     return sendError(res, 500, 'Error searching users', { details: err.message });
+  }
+});
+
+// ========== NEW: SEND FRIEND REQUEST ENDPOINT ==========
+app.post('/friends/add', async (req, res) => {
+  if (!isDatabaseConnected()) {
+    return sendError(res, 503, 'Database not available');
+  }
+
+  try {
+    const { friendId } = req.body;
+    const userId = req.body.userId || req.headers['x-user-id'];
+
+    if (!userId || !friendId) {
+      return sendError(res, 400, 'userId and friendId are required');
+    }
+
+    if (userId === friendId) {
+      return sendError(res, 400, 'Cannot add yourself as a friend');
+    }
+
+    // Check if friend exists
+    const friendUser = await User.findOne({ userId: friendId, isActive: true });
+    if (!friendUser) {
+      return sendError(res, 404, 'User not found');
+    }
+
+    // Check if already friends or pending request
+    const existingRequest = await Friend.findOne({
+      $or: [
+        { userId: userId, friendId: friendId },
+        { userId: friendId, friendId: userId },
+      ],
+    });
+
+    if (existingRequest) {
+      return sendError(res, 400, 'Already friends or request pending');
+    }
+
+    // Create pending friend request
+    const friendRequest = new Friend({
+      userId: userId,
+      friendId: friendId,
+      status: 'pending',
+    });
+
+    await friendRequest.save();
+
+    Logger.info('friends/add', 'Friend request sent', { userId, friendId });
+
+    // ✅ Emit socket event to notify the recipient if they are online
+    const recipientSocketId = userSockets.get(friendId);
+    if (recipientSocketId) {
+      io.to(recipientSocketId).emit('friend_request', {
+        requestId: friendRequest._id,
+        fromUserId: userId,
+        fromUserName: (await User.findOne({ userId: userId }))?.userName || 'Unknown',
+        fromUserAvatar: (await User.findOne({ userId: userId }))?.avatarColor || '#128C7F',
+        fromUserImage: (await User.findOne({ userId: userId }))?.profileImageUrl,
+      });
+    } else {
+      Logger.info('friends/add', 'Recipient not online; notification will be delivered when they reconnect', { friendId });
+    }
+
+    return res.status(201).json({
+      success: true,
+      message: 'Friend request sent successfully',
+      requestId: friendRequest._id,
+    });
+
+  } catch (err) {
+    Logger.error('friends/add', 'Error sending friend request', err.message);
+    return sendError(res, 500, 'Error sending friend request', { details: err.message });
+  }
+});
+
+// ========== NEW: ACCEPT FRIEND REQUEST ENDPOINT ==========
+app.post('/friends/request/:requestId/accept', async (req, res) => {
+  if (!isDatabaseConnected()) {
+    return sendError(res, 503, 'Database not available');
+  }
+
+  try {
+    const { requestId } = req.params;
+    const userId = req.body.userId || req.headers['x-user-id'];
+
+    if (!userId || !requestId) {
+      return sendError(res, 400, 'userId and requestId are required');
+    }
+
+    // Find the friend request
+    const friendRequest = await Friend.findById(requestId);
+    if (!friendRequest) {
+      return sendError(res, 404, 'Friend request not found');
+    }
+
+    // Verify this user is the recipient
+    if (friendRequest.friendId !== userId) {
+      return sendError(res, 403, 'Not authorized to accept this request');
+    }
+
+    // Update request status to accepted
+    friendRequest.status = 'accepted';
+    await friendRequest.save();
+
+    Logger.info('friends/request/accept', 'Friend request accepted', { userId, requestId });
+
+    // ✅ Emit socket event to notify the sender if they are online
+    const senderSocketId = userSockets.get(friendRequest.userId);
+    if (senderSocketId) {
+      io.to(senderSocketId).emit('friend_request_accepted', {
+        requestId: friendRequest._id,
+        userIdAccepted: userId,
+        userName: (await User.findOne({ userId: userId }))?.userName || 'Unknown',
+      });
+    } else {
+      Logger.info('friends/request/accept', 'Sender not online; accepted notification skipped', { senderId: friendRequest.userId });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: 'Friend request accepted',
+    });
+
+  } catch (err) {
+    Logger.error('friends/request/accept', 'Error accepting friend request', err.message);
+    return sendError(res, 500, 'Error accepting friend request', { details: err.message });
+  }
+});
+
+// ========== NEW: DENY FRIEND REQUEST ENDPOINT ==========
+app.post('/friends/request/:requestId/deny', async (req, res) => {
+  if (!isDatabaseConnected()) {
+    return sendError(res, 503, 'Database not available');
+  }
+
+  try {
+    const { requestId } = req.params;
+    const userId = req.body.userId || req.headers['x-user-id'];
+
+    if (!userId || !requestId) {
+      return sendError(res, 400, 'userId and requestId are required');
+    }
+
+    // Find and delete the friend request
+    const friendRequest = await Friend.findByIdAndDelete(requestId);
+    if (!friendRequest) {
+      return sendError(res, 404, 'Friend request not found');
+    }
+
+    // Verify this user is the recipient
+    if (friendRequest.friendId !== userId) {
+      return sendError(res, 403, 'Not authorized to deny this request');
+    }
+
+    Logger.info('friends/request/deny', 'Friend request denied', { userId, requestId });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Friend request denied',
+    });
+
+  } catch (err) {
+    Logger.error('friends/request/deny', 'Error denying friend request', err.message);
+    return sendError(res, 500, 'Error denying friend request', { details: err.message });
+  }
+});
+
+// ========== NEW: REMOVE FRIEND ENDPOINT ==========
+app.post('/friends/remove', async (req, res) => {
+  if (!isDatabaseConnected()) {
+    return sendError(res, 503, 'Database not available');
+  }
+
+  try {
+    const { friendId } = req.body;
+    const userId = req.body.userId || req.headers['x-user-id'];
+
+    if (!userId || !friendId) {
+      return sendError(res, 400, 'userId and friendId are required');
+    }
+
+    if (userId === friendId) {
+      return sendError(res, 400, 'Cannot remove yourself as a friend');
+    }
+
+    const deleted = await Friend.findOneAndDelete({
+      $or: [
+        { userId: userId, friendId: friendId },
+        { userId: friendId, friendId: userId },
+      ],
+      status: 'accepted',
+    });
+
+    if (!deleted) {
+      return sendError(res, 404, 'Friend relationship not found');
+    }
+
+    Logger.info('friends/remove', 'Friend removed', { userId, friendId });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Friend removed successfully',
+    });
+  } catch (err) {
+    Logger.error('friends/remove', 'Error removing friend', err.message);
+    return sendError(res, 500, 'Error removing friend', { details: err.message });
+  }
+});
+
+// ========== NEW: GET FRIENDS LIST ENDPOINT ==========
+app.get('/friends/list', async (req, res) => {
+  if (!isDatabaseConnected()) {
+    return sendError(res, 503, 'Database not available');
+  }
+
+  try {
+    const userId = req.query.userId || req.headers['x-user-id'];
+
+    if (!userId) {
+      return sendError(res, 400, 'userId is required');
+    }
+
+    // Get all friends
+    const friends = await Friend.find({
+      $or: [
+        { userId: userId },
+        { friendId: userId },
+      ],
+      status: 'accepted',
+    }).lean();
+
+    // Get friend user details with all profile fields
+    const friendIds = friends.map((f) => (f.userId === userId ? f.friendId : f.userId));
+    const friendUsers = await User.find(
+      { userId: { $in: friendIds }, isActive: true },
+      'userId userName avatarColor avatarLetter profileImageUrl gender country'
+    ).lean();
+
+    // ✅ Enhanced: Include online status by checking if user has active socket
+    const friendList = friendUsers.map((u) => ({
+      userId: u.userId,
+      userName: u.userName,
+      avatarColor: u.avatarColor,
+      avatarLetter: u.avatarLetter || u.userName.charAt(0).toUpperCase(),
+      profileImageUrl: u.profileImageUrl,
+      gender: u.gender || 'other',
+      country: u.country || null,
+      isOnline: userSockets.has(u.userId), // ✅ Check if user is currently connected
+    }));
+
+    return res.status(200).json({
+      success: true,
+      friends: friendList,
+      count: friendList.length,
+    });
+
+  } catch (err) {
+    Logger.error('friends/list', 'Error getting friends list', err.message);
+    return sendError(res, 500, 'Error getting friends list', { details: err.message });
   }
 });
 
@@ -803,7 +1134,13 @@ app.post('/user/:userId/update', validateProfileUpdate, async (req, res) => {
       }
     }
 
-    const safeFields = ['email', 'userName', 'gender', 'country', 'avatarColor', 'profileImageUrl', 'pictureName', 'birthDate', 'authType', 'isGuest', 'updatedAt'];
+    // ✅ Set profileComplete to true if both gender and country are provided
+    if (normalizedGender && country) {
+      updateData.profileComplete = true;
+      Logger.info('user/update', '✅ Profile marked as complete', { userId });
+    }
+
+    const safeFields = ['email', 'userName', 'gender', 'country', 'avatarColor', 'profileImageUrl', 'pictureName', 'birthDate', 'authType', 'isGuest', 'xp', 'profileComplete', 'updatedAt'];
     const safeUpdateData = {};
     for (const key of safeFields) {
       if (Object.prototype.hasOwnProperty.call(updateData, key)) {
@@ -840,6 +1177,8 @@ app.post('/user/:userId/update', validateProfileUpdate, async (req, res) => {
         country: user.country,
         avatarColor: user.avatarColor,
         profileImageUrl: user.profileImageUrl,
+        profileComplete: user.profileComplete || false, // ✅ Include profileComplete flag in response
+        xp: getUserXp(user),
         birthDate: user.birthDate,
         authType: user.authType,
       },
@@ -1324,6 +1663,7 @@ async function attemptMatch(roomType = 'video') {
     // Normalize outgoing user object to guarantee profile image keys the frontend expects
     const normalizeOutgoingUser = (ud) => {
       const profileImage = ud && (ud.profileImagePath || ud.profile_image_path || ud.profileImage || ud.profile_pic || ud.photo) ? (ud.profileImagePath || ud.profile_image_path || ud.profileImage || ud.profile_pic || ud.photo) : null;
+    const profileImageUrl = ud && (ud.profileImageUrl || ud.photoUrl || ud.photo_url || ud.avatarUrl || ud.avatar_url) ? (ud.profileImageUrl || ud.photoUrl || ud.photo_url || ud.avatarUrl || ud.avatar_url) : null;
       return {
         userId: ud.userId || null,
         userName: ud.userName || 'Unknown',
@@ -1333,6 +1673,7 @@ async function attemptMatch(roomType = 'video') {
         profileImagePath: profileImage,
         profile_image_path: profileImage,
         profileImage: profileImage,
+        profileImageUrl: profileImageUrl,
       };
     };
 
@@ -1358,6 +1699,8 @@ async function attemptMatch(roomType = 'video') {
     const iceServers = buildIceServers();
     const matchedData1 = {
       peers: [user1.socketId, user2.socketId],
+      peerId: user2.socketId,
+      initiator: true,
       remoteUser: user2Out,
       matchId,
       iceServers,
@@ -1366,6 +1709,8 @@ async function attemptMatch(roomType = 'video') {
     };
     const matchedData2 = {
       peers: [user1.socketId, user2.socketId],
+      peerId: user1.socketId,
+      initiator: false,
       remoteUser: user1Out,
       matchId,
       iceServers,
@@ -1456,6 +1801,18 @@ io.on('connection', (socket) => {
 
   socket.emit('SignallingClient', socket.id);
 
+  // Preserve handshake userId so home-screen socket connections can still receive notifications
+  const handshakeUserId = socket.handshake?.query?.userId;
+  if (handshakeUserId) {
+    socket.data = socket.data || {};
+    socket.data.userId = handshakeUserId;
+    userSockets.set(handshakeUserId, socket.id);
+    socketMetadata.set(socket.id, {
+      userId: handshakeUserId,
+      joinedAt: Date.now(),
+    });
+  }
+
   // User registration - MINIMAL data only for socket identification
   socket.on('register_user', (userData, callback) => {
     try {
@@ -1505,6 +1862,9 @@ io.on('connection', (socket) => {
         // Backend only keeps what's needed for video/chat identification
       });
 
+      socket.data = socket.data || {};
+      socket.data.userId = userData.userId;
+      socket.data.userName = userData.userName;
       userSockets.set(userData.userId, socket.id);
 
       // Simple logging - no sensitive data stored
@@ -2458,6 +2818,126 @@ io.on('connection', (socket) => {
     } catch (err) {
       Logger.error('gift_star', 'Error processing star gift', err && err.message);
       if (callback) callback({ success: false, error: 'Failed to gift star' });
+    }
+  });
+
+  // ========== TYPING INDICATORS ==========
+  // ✅ NEW: Send typing indicator when user types in direct message
+  socket.on('send_typing', (data) => {
+    try {
+      const { recipientId, isTyping } = data;
+      const senderMeta = socketMetadata.get(socket.id) || {};
+      const senderId = senderMeta.userId;
+      
+      if (!senderId || !recipientId) {
+        Logger.warn('send_typing', 'Missing senderId or recipientId', { senderId, recipientId });
+        return;
+      }
+
+      const recipientSocketId = userSockets.get(recipientId);
+      if (!recipientSocketId) {
+        Logger.debug('send_typing', 'Recipient not online, skipping typing indicator', { senderId, recipientId });
+        return;
+      }
+
+      // Send typing indicator to recipient
+      io.to(recipientSocketId).emit('user_typing', {
+        senderId,
+        senderName: senderMeta.userName || 'Unknown',
+        isTyping,
+        timestamp: Date.now(),
+      });
+    } catch (err) {
+      Logger.error('send_typing', 'Error sending typing indicator', err && err.message);
+    }
+  });
+
+  // ========== PROFILE UPDATE BROADCASTS ==========
+  // ✅ NEW: Broadcast profile updates to all connected peers
+  socket.on('profile_updated', (data) => {
+    try {
+      const senderMeta = socketMetadata.get(socket.id) || {};
+      const userId = senderMeta.userId;
+      
+      if (!userId) {
+        Logger.warn('profile_updated', 'User not registered', { socketId: socket.id });
+        return;
+      }
+
+      // Extract updated fields
+      const profileUpdate = {
+        userId,
+        userName: data.userName || senderMeta.userName,
+        avatarColor: data.avatarColor || senderMeta.avatarColor,
+        avatarLetter: data.avatarLetter || senderMeta.avatarLetter,
+        gender: data.gender || null,
+        country: data.country || null,
+        profileImagePath: data.profileImagePath || null,
+        profileImageUrl: data.profileImageUrl || null,
+        timestamp: Date.now(),
+      };
+
+      // Update socket metadata with new profile data
+      socketMetadata.set(socket.id, {
+        ...senderMeta,
+        userName: profileUpdate.userName,
+        avatarColor: profileUpdate.avatarColor,
+        avatarLetter: profileUpdate.avatarLetter,
+        profileImagePath: profileUpdate.profileImagePath || senderMeta.profileImagePath,
+      });
+
+      // Broadcast update to all connected clients
+      io.emit('profile_update', profileUpdate);
+
+      Logger.info('profile_updated', 'Profile update broadcasted', {
+        userId,
+        fields: Object.keys(profileUpdate).join(', '),
+      });
+    } catch (err) {
+      Logger.error('profile_updated', 'Error broadcasting profile update', err && err.message);
+    }
+  });
+
+  // ========== DIRECT MESSAGE EVENTS ==========
+  // ✅ NEW: Handle direct messages with proper profile image data
+  socket.on('send_direct_message', (data) => {
+    try {
+      const { recipientId, content, messageId } = data;
+      const senderMeta = socketMetadata.get(socket.id) || {};
+      const senderId = senderMeta.userId;
+      
+      if (!senderId || !recipientId) {
+        Logger.warn('send_direct_message', 'Missing senderId or recipientId', { senderId, recipientId });
+        return;
+      }
+
+      const recipientSocketId = userSockets.get(recipientId);
+      if (!recipientSocketId) {
+        Logger.debug('send_direct_message', 'Recipient offline, message stored locally', { senderId, recipientId });
+        return;
+      }
+
+      // Send message to recipient with full sender profile
+      io.to(recipientSocketId).emit('direct_message', {
+        id: messageId || `msg_${Date.now()}`,
+        senderId,
+        senderName: senderMeta.userName || 'Unknown',
+        recipientId,
+        content,
+        profileImagePath: senderMeta.profileImagePath,
+        senderProfileImagePath: senderMeta.profileImagePath,
+        avatarColor: senderMeta.avatarColor || '#128C7E',
+        avatarLetter: senderMeta.avatarLetter || 'U',
+        timestamp: new Date().toISOString(),
+      });
+
+      Logger.info('send_direct_message', 'Direct message sent', {
+        senderId,
+        recipientId,
+        messageId,
+      });
+    } catch (err) {
+      Logger.error('send_direct_message', 'Error sending direct message', err && err.message);
     }
   });
 
