@@ -213,6 +213,11 @@ const safeMongoUri = MONGODB_CONFIG.URI.replace(/^(mongodb(?:\+srv)?:\/\/)([^@]+
 console.log('🔄 Connecting to MongoDB...');
 console.log(`📍 MongoDB Host: ${safeMongoUri}`);
 
+// ✅ START SERVER IMMEDIATELY (don't wait for MongoDB)
+// This allows Cloud Run health check to pass while MongoDB connects in the background
+startServer();
+
+// ✅ Connect to MongoDB asynchronously (non-blocking)
 mongoose.connect(MONGODB_CONFIG.URI, MONGODB_CONFIG.options)
   .then(() => {
     console.log('✅ Connected to MongoDB successfully!');
@@ -221,7 +226,6 @@ mongoose.connect(MONGODB_CONFIG.URI, MONGODB_CONFIG.options)
       timestamp: new Date().toISOString(),
     });
     health.setDbConnected(true);
-    startServer();
   })
   .catch(err => {
     console.error('❌ MongoDB connection error:', err.message);
