@@ -193,6 +193,39 @@ const MONGODB_CONFIG = {
   },
 };
 
+// ========== CONFIGURATION ==========
+const CONFIG = {
+  PORT: process.env.PORT || 8080,
+  // ✅ For development: Use 0.0.0.0 (accessible from Android emulator at 10.0.2.2)
+  // For production: Set SERVER_IP env var to public IP
+  SERVER_IP: process.env.SERVER_IP || 'localhost',
+  // Host/interface to bind the HTTP server to (defaults to all interfaces for emulator access)
+  SERVER_BIND: process.env.SERVER_BIND || '0.0.0.0',
+  STALE_TIMEOUT: 5 * 60 * 1000, // 5 minutes
+  CLEANUP_INTERVAL: 60 * 1000, // 60 seconds
+  MAX_USERNAME_LENGTH: 50,
+  // ✅ GROUP ROOM CAPACITY: 10-user limit per room with auto-replica creation
+  GROUP_ROOM_CAPACITY: 10,
+  // ✅ OPTIMIZE: Faster member list sync
+  MEMBER_SYNC_INTERVAL: 500, // ms - how often to sync member list to room
+  PRESENCE_BROADCAST_INTERVAL: 250, // ms - debounce status broadcasts
+  // Optional TURN config via environment variables
+  TURN_URL: process.env.TURN_URL || null,
+  TURN_USERNAME: process.env.TURN_USERNAME || null,
+  TURN_CREDENTIAL: process.env.TURN_CREDENTIAL || null,
+  // Default ICE servers (will include TURN if provided via env)
+  DEFAULT_ICE_SERVERS: [
+    { urls: 'stun:stun.l.google.com:19302' },
+  ],
+  // Suggested media constraints clients can use to improve quality
+  MEDIA_CONSTRAINTS: {
+    video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+    audio: true,
+    // Suggested target bitrate in kbps for clients to try to apply via setParameters
+    suggestedVideoBitrateKbps: 1000,
+  },
+};
+
 const isDatabaseConnected = () => mongoose.connection.readyState === 1;
 let serverStarted = false;
 
@@ -1192,39 +1225,6 @@ app.post('/user/:userId/update', validateProfileUpdate, async (req, res) => {
     return sendError(res, 500, 'Error updating user', { details: err.message });
   }
 });
-
-// ========== CONFIGURATION ==========
-const CONFIG = {
-  PORT: process.env.PORT || 8080,
-  // ✅ For development: Use 0.0.0.0 (accessible from Android emulator at 10.0.2.2)
-  // For production: Set SERVER_IP env var to public IP
-  SERVER_IP: process.env.SERVER_IP || 'localhost',
-  // Host/interface to bind the HTTP server to (defaults to all interfaces for emulator access)
-  SERVER_BIND: process.env.SERVER_BIND || '0.0.0.0',
-  STALE_TIMEOUT: 5 * 60 * 1000, // 5 minutes
-  CLEANUP_INTERVAL: 60 * 1000, // 60 seconds
-  MAX_USERNAME_LENGTH: 50,
-  // ✅ GROUP ROOM CAPACITY: 10-user limit per room with auto-replica creation
-  GROUP_ROOM_CAPACITY: 10,
-  // ✅ OPTIMIZE: Faster member list sync
-  MEMBER_SYNC_INTERVAL: 500, // ms - how often to sync member list to room
-  PRESENCE_BROADCAST_INTERVAL: 250, // ms - debounce status broadcasts
-  // Optional TURN config via environment variables
-  TURN_URL: process.env.TURN_URL || null,
-  TURN_USERNAME: process.env.TURN_USERNAME || null,
-  TURN_CREDENTIAL: process.env.TURN_CREDENTIAL || null,
-  // Default ICE servers (will include TURN if provided via env)
-  DEFAULT_ICE_SERVERS: [
-    { urls: 'stun:stun.l.google.com:19302' },
-  ],
-  // Suggested media constraints clients can use to improve quality
-  MEDIA_CONSTRAINTS: {
-    video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
-    audio: true,
-    // Suggested target bitrate in kbps for clients to try to apply via setParameters
-    suggestedVideoBitrateKbps: 1000,
-  },
-};
 
 // Room ID / Invite generation constants
 const ROOM_CONSTS = {
