@@ -92,6 +92,8 @@ const GOOGLE_CLIENT_IDS = Array.from(
 const { Logger } = require('./utils/logger');
 const { sendError, sendSuccess } = require('./utils/responseHandler');
 const { validateUserData } = require('./utils/userRegistration');
+const { userCache } = require('./utils/userCache');
+const { mongoDBManager } = require('./utils/mongoDBManager');
 const cors = require('cors');
 
 // ✅ Import enhancement middleware
@@ -250,25 +252,40 @@ console.log(`📍 MongoDB Host: ${safeMongoUri}`);
 // This allows Cloud Run health check to pass while MongoDB connects in the background
 startServer();
 
-// ✅ Connect to MongoDB asynchronously (non-blocking)
-mongoose.connect(MONGODB_CONFIG.URI, MONGODB_CONFIG.options)
-  .then(() => {
-    console.log('✅ Connected to MongoDB successfully!');
-    Logger.info('mongodb', '✅ Connected to MongoDB', {
-      uri: safeMongoUri,
-      timestamp: new Date().toISOString(),
-    });
-    health.setDbConnected(true);
-  })
-  .catch(err => {
-    console.error('❌ MongoDB connection error:', err.message);
-    Logger.error('mongodb', '❌ MongoDB connection error', err.message);
-    health.setDbConnected(false);
-    setTimeout(() => {
-      console.log('🔄 Attempting MongoDB reconnection...');
-      mongoose.connect(MONGODB_CONFIG.URI, MONGODB_CONFIG.options);
+// ✅ IMPROVED: Use MongoDB Manager with exponential backoff retry
+Logger.info('mongodb', '🔄 Initializing MongoDB connection manager', {
+  uri: safeMongoUri,
+});
+
+(async () => {
+  let connected = await mongoDBManager.connect(MONGODB_CONFIG.URI, MONGODB_CONFIG.options);
+
+  if (!connected) {
+    // Attempt to reconnect with exponential backoff
+    const reconnectLoop = async () => {
+      if (!mongoDBManager.getConnectionStatus()) {
+        connected = await mongoDBManager.reconnect(MONGODB_CONFIG.URI, MONGODB_CONFIG.options);
+        if (!connected && mongoDBManager.reconnectAttempts < mongoDBManager.maxReconnectAttempts) {
+          // Schedule next reconnection attempt
+          return;
+        }
+      }
+    };
+
+    // Attempt reconnection every 5 seconds if not connected
+    const reconnectInterval = setInterval(async () => {
+      if (mongoDBManager.getConnectionStatus()) {
+        clearInterval(reconnectInterval);
+        health.setDbConnected(true);
+        Logger.info('mongodb', '✅ Database reconnected successfully');
+      } else {
+        await reconnectLoop();
+      }
     }, 5000);
-  });
+  } else {
+    health.setDbConnected(true);
+  }
+})();
 
 // Handle MongoDB connection events
 mongoose.connection.on('disconnected', () => {
@@ -282,16 +299,27 @@ mongoose.connection.on('error', (err) => {
 });
 
 
-// Configure CORS for socket.io
+// ✅ OPTIMIZED: Socket.IO Configuration for maximum performance
 const io = socketIO(server, {
   cors: {
     origin: ALLOWED_ORIGINS.includes('*') ? '*' : ALLOWED_ORIGINS,
     methods: ['GET', 'POST'],
   },
-  // Allow polling fallback for environments where pure websocket may fail
-  transports: ['websocket', 'polling'], // ✅ WebSocket first for lower latency
-  pingInterval: 15000, // ✅ Reduced from 25000 for faster detection
-  pingTimeout: 45000,  // ✅ Reduced from 60000
+  
+  // ✅ OPTIMIZED: Transport options
+  transports: ['websocket', 'polling'],
+  
+  // ✅ OPTIMIZED: Connection timing
+  pingInterval: 10000,  // Check connection every 10s (was 15s)
+  pingTimeout: 4000,    // Wait 4s for pong (was 45s) - faster detection
+  
+  // ✅ OPTIMIZED: Payload settings
+  maxHttpBufferSize: 1e5,  // 100KB max payload (prevent large uploads)
+  
+  // ✅ OPTIMIZED: Connection settings
+  upgrade: true,           // Allow upgrade from polling to WebSocket
+  rememberUpgrade: true,   // Remember which transport works
+  connectTimeout: 5000,    // 5s to establish connection
 });
 
 // ========== MONGODB SCHEMAS ==========
@@ -525,7 +553,8 @@ app.post('/auth/validate-token', validateTokenLimiter, asyncHandler(async (req, 
 
     try {
       // ✅ STEP 1: Check if email ALREADY EXISTS before upserting
-      // This is the primary way to determine if user is returning or new
+      // This is the PRIMARY and DEFINITIVE way to determine if user is returning or new
+      // Email existence is the source of truth for determining user status
       let emailExists = false;
       const userEmail = userParams.email?.toLowerCase();
       
@@ -533,6 +562,13 @@ app.post('/auth/validate-token', validateTokenLimiter, asyncHandler(async (req, 
         const existingByEmail = await User.findOne({ email: userEmail }).lean();
         emailExists = !!existingByEmail;
         console.log('🔍 Email existence check:', { email: userEmail, exists: emailExists });
+      }
+
+      // If no email, check by userId as fallback
+      if (!emailExists && userId) {
+        const existingByUserId = await User.findOne({ userId }).lean();
+        emailExists = !!existingByUserId;
+        console.log('🔍 UserID fallback check (no email):', { userId, exists: emailExists });
       }
 
       const updateData = {
@@ -557,6 +593,7 @@ app.post('/auth/validate-token', validateTokenLimiter, asyncHandler(async (req, 
             gender: 'other',
             country: null,
             avatarColor: '#128C7E',
+            profileComplete: false, // ✅ NEW: Default profileComplete to false for new users
             createdAt: new Date(),
           },
         },
@@ -565,9 +602,9 @@ app.post('/auth/validate-token', validateTokenLimiter, asyncHandler(async (req, 
 
       console.log('✅ User saved/updated in MongoDB:', savedUser);
 
-      // ✅ STEP 3: Determine if user is existing based on email
-      // An "existing user" is one whose email was ALREADY in the system
-      // This is more reliable than checking profile completion
+      // ✅ STEP 3: Determine if user is existing based on email (THE SOURCE OF TRUTH)
+      // An "existing user" is one whose email was ALREADY in the system BEFORE upsert
+      // This is RELIABLE and CONSISTENT
       isExistingUser = emailExists;
 
       if (savedUser) {
@@ -593,6 +630,7 @@ app.post('/auth/validate-token', validateTokenLimiter, asyncHandler(async (req, 
       user: savedUser ? {
         userId: savedUser.userId,
         userName: savedUser.userName,
+        email: savedUser.email, // ✅ CRITICAL: Include email so frontend can persist it
         gender: savedUser.gender,
         country: savedUser.country,
         avatarColor: savedUser.avatarColor,
@@ -661,6 +699,11 @@ app.post('/auth/register', registerLimiter, validateRegistration, asyncHandler(a
         userId: newUser.userId,
         userName: newUser.userName,
         email: newUser.email,
+        authType: newUser.authType,
+        isGuest: newUser.isGuest,
+        avatarColor: newUser.avatarColor,
+        gender: newUser.gender,
+        country: newUser.country,
       },
     }, 'User registered successfully');
   } catch (err) {
@@ -701,11 +744,15 @@ app.post('/auth/login', loginLimiter, validateAuth, asyncHandler(async (req, res
         userId: user.userId,
         userName: user.userName,
         email: user.email,
+        authType: user.authType,
+        isGuest: user.isGuest,
         gender: user.gender,
         country: user.country,
         avatarColor: user.avatarColor,
         profileImageUrl: user.profileImageUrl,
         xp: getUserXp(user),
+        profileComplete: user.profileComplete || false,
+        lastLogin: user.lastLogin,
       },
     }, 'Login successful');
   } catch (err) {
@@ -714,20 +761,27 @@ app.post('/auth/login', loginLimiter, validateAuth, asyncHandler(async (req, res
   }
 }));
 
-// ========== NEW: GET USER PROFILE ENDPOINT ==========
-// DEBUG: List users for immediate verification
-app.get('/debug/users', async (req, res) => {
-  if (!isDatabaseConnected()) {
-    return sendError(res, 503, 'Database not connected', 'DB_NOT_CONNECTED');
-  }
-  try {
-    const users = await User.find({}).limit(30).lean();
-    return sendSuccess(res, { users }, 'Debug: list user documents');
-  } catch (err) {
-    return sendError(res, 500, 'Debug query failed', { details: err.message });
-  }
+// ========== PERFORMANCE: SYSTEM STATS ENDPOINT ==========
+app.get('/stats/system', (req, res) => {
+  const cacheStats = userCache.getStats();
+  const dbStats = mongoDBManager.getStats();
+  
+  return sendSuccess(res, {
+    cache: cacheStats,
+    database: dbStats,
+    timestamp: new Date().toISOString(),
+  });
 });
 
+// ========== PERFORMANCE: CACHE MANAGEMENT ==========
+app.post('/cache/clear', (req, res) => {
+  const sizeBefore = userCache.cache.size;
+  userCache.clear();
+  Logger.info('cache/clear', 'Cache cleared', { sizeBefore });
+  return sendSuccess(res, { cleared: sizeBefore });
+});
+
+// ========== NEW: GET USER PROFILE ENDPOINT ==========
 app.get('/user/:userId', async (req, res) => {
   if (!isDatabaseConnected()) {
     return sendError(res, 503, 'Database not connected', 'DB_NOT_CONNECTED');
@@ -735,9 +789,19 @@ app.get('/user/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
 
-    const user = await User.findOne({ userId });
+    // ✅ PERFORMANCE: Check cache first
+    let user = userCache.get(userId);
+    
     if (!user) {
-      return sendError(res, 404, 'User not found', 'USER_NOT_FOUND');
+      // ✅ Optimize query with .lean() for read-only operations
+      user = await User.findOne({ userId }).lean().exec();
+      
+      if (!user) {
+        return sendError(res, 404, 'User not found', 'USER_NOT_FOUND');
+      }
+      
+      // ✅ Cache the result for future requests
+      userCache.set(userId, user);
     }
 
     return sendSuccess(res, {
@@ -745,12 +809,16 @@ app.get('/user/:userId', async (req, res) => {
         userId: user.userId,
         userName: user.userName,
         email: user.email,
+        authType: user.authType,
+        isGuest: user.isGuest,
         gender: user.gender,
         country: user.country,
         avatarColor: user.avatarColor,
         profileImageUrl: user.profileImageUrl,
         xp: getUserXp(user),
+        profileComplete: user.profileComplete || false,
         createdAt: user.createdAt,
+        lastLogin: user.lastLogin,
       },
     });
   } catch (err) {
@@ -788,20 +856,21 @@ app.get('/users/search', async (req, res) => {
         { email: fuzzyRegex },
       ],
     })
+      .select('userId userName email gender country avatarColor avatarLetter profileImageUrl profileImagePath createdAt lastLogin xp')
       .sort({ createdAt: -1 })
       .limit(25)
-      .lean();
+      .lean()
+      .exec();
 
     Logger.info('users/search', `Search results: ${users.length} users found`, {
       query: searchText,
       count: users.length,
     });
 
-    console.log('🔍 Search query:', searchText);
-    console.log('📊 Found users:', users.length);
-    if (users.length > 0) {
-      console.log('✅ First result:', users[0]);
-    }
+    // ✅ PERFORMANCE: Cache results for repeated queries
+    users.forEach(user => {
+      userCache.set(user.userId, user);
+    });
 
     // ✅ ENHANCED: Return all fields frontend needs
     return res.status(200).json(users.map((user) => ({
@@ -813,10 +882,10 @@ app.get('/users/search', async (req, res) => {
       avatarColor: user.avatarColor,
       avatarLetter: (user.userName && user.userName.length > 0) 
         ? user.userName.charAt(0).toUpperCase() 
-        : 'U',  // ✅ NEW: Add avatar letter for display
+        : 'U',
       profileImageUrl: user.profileImageUrl,
-      profileImagePath: user.profileImagePath,  // ✅ NEW: Include profile image path
-      isOnline: false,  // ✅ NEW: Add online status (users from search are not in active connections)
+      profileImagePath: user.profileImagePath,
+      isOnline: false,
       xp: getUserXp(user),
       createdAt: user.createdAt,
       lastLogin: user.lastLogin,
@@ -824,7 +893,6 @@ app.get('/users/search', async (req, res) => {
 
   } catch (err) {
     Logger.error('users/search', 'Error searching users', err.message);
-    console.error('❌ Search error details:', err);
     return sendError(res, 500, 'Error searching users', { details: err.message });
   }
 });
@@ -847,8 +915,13 @@ app.post('/friends/add', async (req, res) => {
       return sendError(res, 400, 'Cannot add yourself as a friend');
     }
 
-    // Check if friend exists
-    const friendUser = await User.findOne({ userId: friendId, isActive: true });
+    // ✅ OPTIMIZED: Check if friend exists with cache or single query
+    let friendUser = userCache.get(friendId);
+    if (!friendUser) {
+      friendUser = await User.findOne({ userId: friendId, isActive: true }).lean().exec();
+      if (friendUser) userCache.set(friendId, friendUser);
+    }
+    
     if (!friendUser) {
       return sendError(res, 404, 'User not found');
     }
@@ -859,7 +932,7 @@ app.post('/friends/add', async (req, res) => {
         { userId: userId, friendId: friendId },
         { userId: friendId, friendId: userId },
       ],
-    });
+    }).lean().exec();
 
     if (existingRequest) {
       return sendError(res, 400, 'Already friends or request pending');
@@ -876,18 +949,25 @@ app.post('/friends/add', async (req, res) => {
 
     Logger.info('friends/add', 'Friend request sent', { userId, friendId });
 
+    // ✅ OPTIMIZED: Get sender user for notification from cache
+    let senderUser = userCache.get(userId);
+    if (!senderUser) {
+      senderUser = await User.findOne({ userId: userId }).lean().exec();
+      if (senderUser) userCache.set(userId, senderUser);
+    }
+
     // ✅ Emit socket event to notify the recipient if they are online
     const recipientSocketId = userSockets.get(friendId);
-    if (recipientSocketId) {
+    if (recipientSocketId && senderUser) {
       io.to(recipientSocketId).emit('friend_request', {
         requestId: friendRequest._id,
         fromUserId: userId,
-        fromUserName: (await User.findOne({ userId: userId }))?.userName || 'Unknown',
-        fromUserAvatar: (await User.findOne({ userId: userId }))?.avatarColor || '#128C7F',
-        fromUserImage: (await User.findOne({ userId: userId }))?.profileImageUrl,
+        fromUserName: senderUser.userName || 'Unknown',
+        fromUserAvatar: senderUser.avatarColor || '#128C7F',
+        fromUserImage: senderUser.profileImageUrl,
       });
     } else {
-      Logger.info('friends/add', 'Recipient not online; notification will be delivered when they reconnect', { friendId });
+      Logger.info('friends/add', 'Recipient not online', { friendId });
     }
 
     return res.status(201).json({
@@ -917,7 +997,7 @@ app.post('/friends/request/:requestId/accept', async (req, res) => {
     }
 
     // Find the friend request
-    const friendRequest = await Friend.findById(requestId);
+    const friendRequest = await Friend.findById(requestId).lean().exec();
     if (!friendRequest) {
       return sendError(res, 404, 'Friend request not found');
     }
@@ -927,22 +1007,30 @@ app.post('/friends/request/:requestId/accept', async (req, res) => {
       return sendError(res, 403, 'Not authorized to accept this request');
     }
 
-    // Update request status to accepted
-    friendRequest.status = 'accepted';
-    await friendRequest.save();
+    // ✅ OPTIMIZED: Update request status
+    const updatedRequest = await Friend.findByIdAndUpdate(
+      requestId,
+      { status: 'accepted', updatedAt: new Date() },
+      { new: true, lean: true }
+    ).exec();
 
     Logger.info('friends/request/accept', 'Friend request accepted', { userId, requestId });
 
+    // ✅ OPTIMIZED: Get recipient data from cache
+    let recipientUser = userCache.get(userId);
+    if (!recipientUser) {
+      recipientUser = await User.findOne({ userId: userId }).lean().exec();
+      if (recipientUser) userCache.set(userId, recipientUser);
+    }
+
     // ✅ Emit socket event to notify the sender if they are online
     const senderSocketId = userSockets.get(friendRequest.userId);
-    if (senderSocketId) {
+    if (senderSocketId && recipientUser) {
       io.to(senderSocketId).emit('friend_request_accepted', {
-        requestId: friendRequest._id,
+        requestId: updatedRequest._id,
         userIdAccepted: userId,
-        userName: (await User.findOne({ userId: userId }))?.userName || 'Unknown',
+        userName: recipientUser.userName || 'Unknown',
       });
-    } else {
-      Logger.info('friends/request/accept', 'Sender not online; accepted notification skipped', { senderId: friendRequest.userId });
     }
 
     return res.status(200).json({
@@ -1122,17 +1210,9 @@ app.post('/user/:userId/update', validateProfileUpdate, async (req, res) => {
 
     Logger.info('user/update', 'Received profile update payload', {
       userId,
-      userName,
-      email,
-      gender,
-      country,
-      avatarColor,
-      profileImageUrl,
-      profileImagePath,
-      pictureName,
-      birthDate,
-      authType,
-      isGuest,
+      hasGender: !!gender,
+      hasCountry: !!country,
+      hasImage: !!profileImageUrl,
     });
 
     const updateData = {
@@ -1185,6 +1265,7 @@ app.post('/user/:userId/update', validateProfileUpdate, async (req, res) => {
       }
     }
 
+    // ✅ OPTIMIZED: Use lean() for the response
     const user = await User.findOneAndUpdate(
       { userId },
       {
@@ -1197,12 +1278,14 @@ app.post('/user/:userId/update', validateProfileUpdate, async (req, res) => {
         },
       },
       { upsert: true, new: true, lean: true, setDefaultsOnInsert: true }
-    );
+    ).exec();
+
+    // ✅ PERFORMANCE: Invalidate cache so next request gets fresh data
+    userCache.invalidate(userId);
 
     Logger.info('user/update', '✅ User profile updated or created', {
       userId,
       created: user.createdAt.getTime() === user.updatedAt.getTime(),
-      user,
     });
 
     return sendSuccess(res, {
@@ -1214,7 +1297,7 @@ app.post('/user/:userId/update', validateProfileUpdate, async (req, res) => {
         country: user.country,
         avatarColor: user.avatarColor,
         profileImageUrl: user.profileImageUrl,
-        profileComplete: user.profileComplete || false, // ✅ Include profileComplete flag in response
+        profileComplete: user.profileComplete || false,
         xp: getUserXp(user),
         birthDate: user.birthDate,
         authType: user.authType,
@@ -1283,6 +1366,8 @@ const userSockets = new Map(); // userId -> socketId
 const socketMetadata = new Map(); // socketId -> { userId, userName, joinedAt }
 const socketQueues = new Map(); // socket.id -> 'video' | 'chat' (track which queue user is in)
 const rateLimitMap = new Map(); // socketId -> { count, resetTime } for abuse prevention
+// ✅ NEW: Store offline messages to deliver when user comes online
+let offlineMessages = new Map(); // userId -> [messagePayload]
 // Star gifting state: counts per room or match and one-time gift tracking
 const starCounts = new Map(); // key -> number (roomId or matchId)
 const oneTimeGifts = new Set(); // `${socketId}:${key}` to prevent duplicate gifts
@@ -1870,6 +1955,23 @@ io.on('connection', (socket) => {
       socket.data.userId = userData.userId;
       socket.data.userName = userData.userName;
       userSockets.set(userData.userId, socket.id);
+
+      // ✅ NEW: Deliver any offline messages when user comes online
+      if (offlineMessages && offlineMessages.has(userData.userId)) {
+        const messages = offlineMessages.get(userData.userId);
+        Logger.info('register_user', `Delivering ${messages.length} offline messages to ${userData.userId}`, {
+          userId: userData.userId,
+          messageCount: messages.length,
+        });
+        
+        // Send all offline messages to the newly connected socket
+        messages.forEach(msg => {
+          socket.emit('direct_message', msg);
+        });
+        
+        // Clear offline messages after delivery
+        offlineMessages.delete(userData.userId);
+      }
 
       // Simple logging - no sensitive data stored
       Logger.info('register_user', 'User registered', {
@@ -2903,7 +3005,7 @@ io.on('connection', (socket) => {
   });
 
   // ========== DIRECT MESSAGE EVENTS ==========
-  // ✅ NEW: Handle direct messages with proper profile image data
+  // ✅ NEW: Handle direct messages with proper routing and offline storage
   socket.on('send_direct_message', (data) => {
     try {
       const { recipientId, content, messageId } = data;
@@ -2915,14 +3017,8 @@ io.on('connection', (socket) => {
         return;
       }
 
-      const recipientSocketId = userSockets.get(recipientId);
-      if (!recipientSocketId) {
-        Logger.debug('send_direct_message', 'Recipient offline, message stored locally', { senderId, recipientId });
-        return;
-      }
-
-      // Send message to recipient with full sender profile
-      io.to(recipientSocketId).emit('direct_message', {
+      // Build message payload
+      const messagePayload = {
         id: messageId || `msg_${Date.now()}`,
         senderId,
         senderName: senderMeta.userName || 'Unknown',
@@ -2933,15 +3029,65 @@ io.on('connection', (socket) => {
         avatarColor: senderMeta.avatarColor || '#128C7E',
         avatarLetter: senderMeta.avatarLetter || 'U',
         timestamp: new Date().toISOString(),
-      });
+      };
 
-      Logger.info('send_direct_message', 'Direct message sent', {
-        senderId,
-        recipientId,
-        messageId,
-      });
+      const recipientSocketId = userSockets.get(recipientId);
+      
+      if (recipientSocketId) {
+        // ✅ IMPORTANT: Recipient is online - send message immediately
+        io.to(recipientSocketId).emit('direct_message', messagePayload);
+        Logger.info('send_direct_message', 'Message sent to online recipient', {
+          senderId,
+          recipientId,
+          recipientSocketId,
+        });
+      } else {
+        // ✅ NEW: Recipient is offline - store message for later delivery
+        Logger.info('send_direct_message', 'Recipient offline, storing message for later', {
+          senderId,
+          recipientId,
+        });
+        
+        // Store in offlineMessages map for delivery when recipient comes online
+        if (!offlineMessages) {
+          offlineMessages = new Map();
+        }
+        if (!offlineMessages.has(recipientId)) {
+          offlineMessages.set(recipientId, []);
+        }
+        offlineMessages.get(recipientId).push(messagePayload);
+      }
     } catch (err) {
       Logger.error('send_direct_message', 'Error sending direct message', err && err.message);
+    }
+  });
+
+  // ✅ NEW: Handle message seen/read receipt - Notify sender that their message was read
+  socket.on('message_seen', (data) => {
+    try {
+      const { senderId, recipientId, senderName, timestamp } = data;
+      const senderSocketId = userSockets.get(senderId);
+
+      if (senderSocketId) {
+        // ✅ Send read receipt confirmation back to sender
+        io.to(senderSocketId).emit('message_read_receipt', {
+          senderId: recipientId,
+          senderName: senderName || 'User',
+          timestamp: timestamp || new Date().toISOString(),
+        });
+        Logger.info('message_seen', 'Read receipt sent to sender', {
+          senderId,
+          recipientId,
+          senderName,
+        });
+      } else {
+        Logger.info('message_seen', 'Sender offline, skipping read receipt', {
+          senderId,
+          recipientId,
+        });
+      }
+    } catch (err) {
+      Logger.error('message_seen', 'Error processing read receipt', err && err.message);
     }
   });
 
