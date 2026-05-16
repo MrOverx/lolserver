@@ -235,7 +235,7 @@ function startServer() {
   if (serverStarted) return;
   serverStarted = true;
   server.listen(CONFIG.PORT, CONFIG.SERVER_BIND, () => {
-    Logger.info('startup', `WebSocket server listening`, {
+    Logger.info('startup', 'WebSocket server listening', {
       bind: CONFIG.SERVER_BIND,
       advertisedIP: CONFIG.SERVER_IP,
       port: CONFIG.PORT,
@@ -313,13 +313,29 @@ const io = socketIO(server, {
   pingInterval: 10000,  // Check connection every 10s (was 15s)
   pingTimeout: 4000,    // Wait 4s for pong (was 45s) - faster detection
   
-  // ✅ OPTIMIZED: Payload settings
-  maxHttpBufferSize: 1e5,  // 100KB max payload (prevent large uploads)
+  // ✅ CRITICAL FIX: Payload settings
+  // Increased from 100KB to 5MB to allow profile images in register_user payload
+  // Server-side validation will discard large images before re-emitting
+  maxHttpBufferSize: 5 * 1024 * 1024,  // 5MB max payload (allows initial profile image upload)
   
   // ✅ OPTIMIZED: Connection settings
   upgrade: true,           // Allow upgrade from polling to WebSocket
   rememberUpgrade: true,   // Remember which transport works
   connectTimeout: 5000,    // 5s to establish connection
+});
+
+// ✅ NEW: Global Socket.IO error handler for connection issues
+io.engine.on('connection_error', (err) => {
+  Logger.error('io_engine', '❌ Socket.IO connection error', {
+    code: err.code,
+    message: err.message,
+    transport: err.req?.url || 'unknown',
+  });
+});
+
+// ✅ NEW: Log all socket disconnection reasons
+io.on('disconnect', (reason) => {
+  Logger.warn('io_disconnect', `🔴 Global disconnect: ${reason}`);
 });
 
 // ========== MONGODB SCHEMAS ==========
@@ -758,6 +774,58 @@ app.post('/auth/login', loginLimiter, validateAuth, asyncHandler(async (req, res
   } catch (err) {
     Logger.error('auth/login', 'Error during login', err.message);
     return sendError(res, 500, 'Login error', { details: err.message });
+  }
+}));
+
+// ========== NEW: GUEST LOGIN ENDPOINT ==========
+// ✅ OPTIMIZED: Quick guest account creation with TTL cleanup
+const guestLimiter = createRateLimiter('guest-login', 20, 60); // 20 per minute
+app.post('/auth/guest-login', guestLimiter, asyncHandler(async (req, res) => {
+  if (!isDatabaseConnected()) {
+    return sendError(res, 503, 'Database not connected', 'DB_NOT_CONNECTED');
+  }
+  try {
+    const { deviceId } = req.body;
+    
+    // ✅ OPTIMIZED: Generate unique guest ID based on timestamp + random
+    const guestId = `guest_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+    const guestName = `Guest${Math.floor(Math.random() * 9000) + 1000}`;
+
+    // ✅ Create guest user (auto-expire after 24 hours)
+    const guestUser = new User({
+      userId: guestId,
+      userName: guestName,
+      email: null,
+      authType: 'GUEST',
+      isGuest: true,
+      gender: 'other',
+      country: null,
+      avatarColor: '#6200EE',
+      profileImageUrl: null,
+      lastLogin: new Date(),
+      // TTL cleanup: Guest accounts expire after 24 hours
+      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+    });
+
+    await guestUser.save();
+
+    Logger.info('auth/guest-login', '✅ Guest account created', { userId: guestId, deviceId });
+
+    return sendSuccess(res, {
+      user: {
+        userId: guestUser.userId,
+        userName: guestUser.userName,
+        authType: 'GUEST',
+        isGuest: true,
+        avatarColor: guestUser.avatarColor,
+        gender: guestUser.gender,
+        country: guestUser.country,
+        lastLogin: guestUser.lastLogin,
+      },
+    }, 'Guest account created');
+  } catch (err) {
+    Logger.error('auth/guest-login', 'Error creating guest account', err.message);
+    return sendError(res, 500, 'Guest login error', { details: err.message });
   }
 }));
 
@@ -1366,6 +1434,8 @@ const userSockets = new Map(); // userId -> socketId
 const socketMetadata = new Map(); // socketId -> { userId, userName, joinedAt }
 const socketQueues = new Map(); // socket.id -> 'video' | 'chat' (track which queue user is in)
 const rateLimitMap = new Map(); // socketId -> { count, resetTime } for abuse prevention
+// ✅ NEW: Cache profile images separately for matched events (not re-emitted in normal traffic)
+const profileImageCache = new Map(); // socketId -> profileImagePath (full data URI or URL)
 // ✅ NEW: Store offline messages to deliver when user comes online
 let offlineMessages = new Map(); // userId -> [messagePayload]
 // Star gifting state: counts per room or match and one-time gift tracking
@@ -1885,8 +1955,17 @@ const MESSAGE_CACHE_TIMEOUT = 30000; // 30 seconds
 
 // ========== SOCKET.IO CONNECTION HANDLER ==========
 io.on('connection', (socket) => {
-  Logger.info('connection', 'Client connected', { socketId: socket.id });
+  Logger.info('connection', '🟢 Client connected', { socketId: socket.id });
   health.updateSocketConnections(io.of('/').sockets.size);
+
+  // ✅ NEW: Add error handler to catch transport errors early
+  socket.on('error', (error) => {
+    Logger.error('socket_error', '❌ Socket error event', {
+      socketId: socket.id,
+      error: error?.message || String(error),
+      code: error?.code,
+    });
+  });
 
   socket.emit('SignallingClient', socket.id);
 
@@ -1905,10 +1984,19 @@ io.on('connection', (socket) => {
   // User registration - MINIMAL data only for socket identification
   socket.on('register_user', (userData, callback) => {
     try {
+      // ✅ NEW: Log incoming user data size for diagnostics
+      const incomingDataSize = JSON.stringify(userData).length;
+      Logger.info('register_user', `📥 Received user data (${Math.round(incomingDataSize / 1024)}KB)`, {
+        socketId: socket.id,
+        dataSizeBytes: incomingDataSize,
+        hasProfileImage: userData?.profileImagePath ? 'yes' : 'no',
+        profileImageSizeKB: userData?.profileImagePath ? Math.round(userData.profileImagePath.length / 1024) : 0,
+      });
+
       const validation = validateUserData(userData);
 
       if (!validation.valid) {
-        Logger.warn('register_user', `Validation failed: ${validation.error}`, { socketId: socket.id });
+        Logger.warn('register_user', `❌ Validation failed: ${validation.error}`, { socketId: socket.id });
         const errorResponse = {
           success: false,
           error: {
@@ -1936,6 +2024,22 @@ io.on('connection', (socket) => {
         if (userData[k]) {
           profileImagePath = userData[k];
           break;
+        }
+      }
+
+      // ✅ CRITICAL: Validate image size (prevent "transport error" / "transport close")
+      const MAX_IMAGE_SIZE = 100 * 1024; // 100KB limit for real-time socket emission
+      if (profileImagePath && typeof profileImagePath === 'string') {
+        const imageSizeBytes = profileImagePath.length; // Base64 string length approximates byte size
+        if (imageSizeBytes > MAX_IMAGE_SIZE) {
+          Logger.warn('register_user', `⚠️ Image too large (${Math.round(imageSizeBytes / 1024)}KB) - discarding to prevent transport error`, {
+            socketId: socket.id,
+            userId: userData.userId,
+            imageSizeKB: Math.round(imageSizeBytes / 1024),
+            maxSizeKB: Math.round(MAX_IMAGE_SIZE / 1024),
+          });
+          // Discard large image to prevent 'transport error' / 'transport close'
+          profileImagePath = null;
         }
       }
 
@@ -1974,10 +2078,12 @@ io.on('connection', (socket) => {
       }
 
       // Simple logging - no sensitive data stored
-      Logger.info('register_user', 'User registered', {
+      Logger.info('register_user', '✅ User registered', {
         socketId: socket.id,
         userId: userData.userId,
         userName: userData.userName,
+        hasProfileImage: profileImagePath !== null,
+        imageSizeKB: profileImagePath ? Math.round(profileImagePath.length / 1024) : 0,
       });
 
       broadcastStats();
@@ -2428,9 +2534,18 @@ io.on('connection', (socket) => {
   // Find partner for video/chat (MongoDB-backed blocking checks)
   socket.on('find_partner', async (data) => {
     try {
+      const roomType = (data && data.type) || 'video';
+      const userData = socketMetadata.get(socket.id);
+
+      Logger.info('find_partner', `🔍 User requesting ${roomType} partner`, {
+        socketId: socket.id,
+        userId: userData?.userId,
+        userName: userData?.userName,
+      });
+
       // Rate limiting check
       if (!checkRateLimit(socket.id)) {
-        Logger.warn('find_partner', 'Rate limit exceeded', { socketId: socket.id });
+        Logger.warn('find_partner', '⏱️ Rate limit exceeded', { socketId: socket.id });
         // ✅ IMPROVED: Better rate limit error response
         socket.emit('error', {
           code: 'RATE_LIMIT_EXCEEDED',
@@ -2439,15 +2554,6 @@ io.on('connection', (socket) => {
         });
         return;
       }
-
-      const roomType = (data && data.type) || 'video';
-      const userData = socketMetadata.get(socket.id);
-
-      Logger.info('find_partner', `User requesting ${roomType} partner`, {
-        socketId: socket.id,
-        userName: userData?.userName,
-        timestamp: new Date().toISOString(),
-      });
 
       if (!isValidSocketId(socket.id)) {
         Logger.warn('find_partner', 'Invalid socket ID', { socketId: socket.id });
