@@ -569,22 +569,31 @@ app.post('/auth/validate-token', validateTokenLimiter, asyncHandler(async (req, 
 
     try {
       // ✅ STEP 1: Check if email ALREADY EXISTS before upserting
-      // This is the PRIMARY and DEFINITIVE way to determine if user is returning or new
-      // Email existence is the source of truth for determining user status
-      let emailExists = false;
+      // This is the PRIMARY way to determine if user is returning or new
+      let fullExistingUser = null;
       const userEmail = userParams.email?.toLowerCase();
       
       if (userEmail) {
-        const existingByEmail = await User.findOne({ email: userEmail }).lean();
-        emailExists = !!existingByEmail;
-        console.log('🔍 Email existence check:', { email: userEmail, exists: emailExists });
+        fullExistingUser = await User.findOne({ email: userEmail });
+        if (fullExistingUser) {
+          Logger.info('oauth/validate', '✅ Existing user found by email', { 
+            userId: fullExistingUser.userId,
+            email: userEmail,
+            profileComplete: fullExistingUser.profileComplete
+          });
+        }
       }
 
-      // If no email, check by userId as fallback
-      if (!emailExists && userId) {
-        const existingByUserId = await User.findOne({ userId }).lean();
-        emailExists = !!existingByUserId;
-        console.log('🔍 UserID fallback check (no email):', { userId, exists: emailExists });
+      // If no email match, check by userId as fallback
+      if (!fullExistingUser && userId) {
+        fullExistingUser = await User.findOne({ userId });
+        if (fullExistingUser) {
+          Logger.info('oauth/validate', '✅ Existing user found by userId', { 
+            userId,
+            email: fullExistingUser.email,
+            profileComplete: fullExistingUser.profileComplete
+          });
+        }
       }
 
       const updateData = {
@@ -597,7 +606,7 @@ app.post('/auth/validate-token', validateTokenLimiter, asyncHandler(async (req, 
         updatedAt: userParams.updatedAt,
       };
 
-      console.log('🔄 Attempting to save user to MongoDB:', { userId, updateData });
+      Logger.debug('oauth/validate', '🔄 Upserting user to MongoDB', { userId });
 
       // ✅ STEP 2: Update or create the user
       savedUser = await User.findOneAndUpdate(
@@ -609,60 +618,51 @@ app.post('/auth/validate-token', validateTokenLimiter, asyncHandler(async (req, 
             gender: 'other',
             country: null,
             avatarColor: '#128C7E',
-            profileComplete: false, // ✅ NEW: Default profileComplete to false for new users
+            profileComplete: false, // Default to false for new users
             createdAt: new Date(),
           },
         },
         { upsert: true, new: true, lean: true, setDefaultsOnInsert: true }
       );
 
-      console.log('✅ User saved/updated in MongoDB:', savedUser);
+      Logger.info('oauth/validate', '✅ User upserted successfully', { userId });
 
-      // ✅ STEP 3: Determine if user is existing based on email (THE SOURCE OF TRUTH)
-      // An "existing user" is one whose email was ALREADY in the system BEFORE upsert
-      // This is RELIABLE and CONSISTENT
-      isExistingUser = emailExists;
+      // ✅ STEP 3: Determine if user is existing
+      // Source of truth: Was user in database BEFORE this upsert?
+      isExistingUser = fullExistingUser !== null;
+      
+      Logger.info('oauth/validate', '📊 User Status', {
+        userId,
+        email: userEmail,
+        isExistingUser,
+        profileComplete: savedUser?.profileComplete || false,
+        hasGender: !!savedUser?.gender,
+        hasCountry: !!savedUser?.country
+      });
 
-      if (savedUser) {
-        Logger.info('oauth/validate', `User existence check for ${userId}`, {
-          email: userEmail,
-          emailExisted: emailExists,
-          profileComplete: savedUser.profileComplete,
-          gender: savedUser.gender,
-          country: savedUser.country,
-          isExisting: isExistingUser,
-        });
-      }
-
-      Logger.info('oauth/validate', '✅ User saved/updated in MongoDB', { userId, isExistingUser, user: savedUser });
-    } catch (dbErr) {
-      console.error('❌ Error saving user to MongoDB:', dbErr);
-      Logger.error('oauth/validate', 'Error saving user to MongoDB', dbErr && dbErr.message);
-      return sendError(res, 500, 'Database error while saving user', { details: dbErr.message });
-    }
-
-    return sendSuccess(res, {
-      isExistingUser,
-      user: savedUser ? {
+      // ✅ Return complete user profile with all required fields
+      const userResponse = {
         userId: savedUser.userId,
         userName: savedUser.userName,
-        email: savedUser.email, // ✅ CRITICAL: Include email so frontend can persist it
-        gender: savedUser.gender,
-        country: savedUser.country,
-        avatarColor: savedUser.avatarColor,
-        profileImageUrl: savedUser.profileImageUrl,
-        profileComplete: savedUser.profileComplete || false, // ✅ NEW: Include profileComplete flag
+        email: savedUser.email,
+        gender: savedUser.gender || 'other',
+        country: savedUser.country || null,
+        birthDate: savedUser.birthDate || null,
+        avatarColor: savedUser.avatarColor || '#128C7E',
+        profileImageUrl: savedUser.profileImageUrl || null,
+        profileImagePath: savedUser.profileImagePath || null,
+        profileComplete: savedUser.profileComplete === true,
         xp: getUserXp(savedUser),
         authType: savedUser.authType,
-        isGuest: savedUser.isGuest,
+        isGuest: savedUser.isGuest || false,
         lastLogin: savedUser.lastLogin,
-      } : {
-        id: tokenData.sub,
-        emailVerified: tokenData.email_verified === 'true',
-        name: tokenData.name,
-        picture: tokenData.picture,
-      },
-    }, 'Token is valid');
+        createdAt: savedUser.createdAt,
+      };
+
+      return sendSuccess(res, {
+        isExistingUser,
+        user: userResponse,
+      }, `Token validated - ${isExistingUser ? 'Existing' : 'New'} user`);
   } catch (err) {
     Logger.error('oauth/validate', 'Error validating token', err && err.message);
     return sendError(res, 500, 'Token validation error', { details: err?.message });
@@ -774,6 +774,63 @@ app.post('/auth/login', loginLimiter, validateAuth, asyncHandler(async (req, res
   } catch (err) {
     Logger.error('auth/login', 'Error during login', err.message);
     return sendError(res, 500, 'Login error', { details: err.message });
+  }
+}));
+
+// ========== NEW: CHECK EMAIL EXISTS ENDPOINT ==========
+// ✅ CRITICAL: Frontend calls this to check if email is registered (for new/existing user detection)
+// Called on fresh Google login to determine if user is new or returning
+app.get('/auth/check-email', asyncHandler(async (req, res) => {
+  if (!isDatabaseConnected()) {
+    return sendError(res, 503, 'Database not connected', 'DB_NOT_CONNECTED');
+  }
+
+  try {
+    const { email } = req.query;
+
+    if (!email || typeof email !== 'string' || email.trim() === '') {
+      return sendError(res, 400, 'Email query parameter is required', 'INVALID_EMAIL');
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
+
+    // Query for user with this email (case-insensitive)
+    const existingUser = await User.findOne({
+      email: { $regex: `^${normalizedEmail.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' }
+    });
+
+    if (existingUser) {
+      // ✅ EMAIL EXISTS - Return user profile for direct home navigation
+      Logger.info('auth/check-email', '✅ Email found in database', { email: normalizedEmail, userId: existingUser.userId });
+
+      return sendSuccess(res, {
+        exists: true,
+        user: {
+          userId: existingUser.userId,
+          userName: existingUser.userName,
+          email: existingUser.email,
+          authType: existingUser.authType,
+          isGuest: existingUser.isGuest || false,
+          gender: existingUser.gender || 'other',
+          country: existingUser.country || null,
+          birthDate: existingUser.birthDate || null,
+          avatarColor: existingUser.avatarColor || '#128C7E',
+          profileImageUrl: existingUser.profileImageUrl || null,
+          profileComplete: existingUser.profileComplete === true, // ✅ Critical flag for profile check
+          xp: getUserXp(existingUser),
+          createdAt: existingUser.createdAt,
+          lastLogin: existingUser.lastLogin,
+        }
+      }, 'Email found - returning user');
+    } else {
+      // ✅ EMAIL NOT FOUND - New user, should proceed to profile creation
+      Logger.info('auth/check-email', 'ℹ️ Email not found in database', { email: normalizedEmail });
+      
+      return sendError(res, 404, 'Email not registered', 'EMAIL_NOT_FOUND');
+    }
+  } catch (err) {
+    Logger.error('auth/check-email', 'Error checking email', err.message);
+    return sendError(res, 500, 'Email check error', { details: err.message });
   }
 }));
 
