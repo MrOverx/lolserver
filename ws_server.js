@@ -663,6 +663,10 @@ app.post('/auth/validate-token', validateTokenLimiter, asyncHandler(async (req, 
         isExistingUser,
         user: userResponse,
       }, `Token validated - ${isExistingUser ? 'Existing' : 'New'} user`);
+    } catch (mongoErr) {
+      Logger.error('oauth/validate', 'Error upserting user to MongoDB', mongoErr?.message);
+      return sendError(res, 500, 'Database error', { details: mongoErr?.message });
+    }
   } catch (err) {
     Logger.error('oauth/validate', 'Error validating token', err && err.message);
     return sendError(res, 500, 'Token validation error', { details: err?.message });
