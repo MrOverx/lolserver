@@ -75,6 +75,43 @@ async function fetchGoogleTokenInfo(idToken) {
   });
 }
 
+async function validateGoogleIdToken(idToken) {
+  const tokenData = await fetchGoogleTokenInfo(idToken);
+
+  const tokenAudiences = Array.isArray(tokenData.aud) ? tokenData.aud : [tokenData.aud];
+  const tokenAuthorizedParty = tokenData.azp ? [tokenData.azp] : [];
+  const tokenIssuer = tokenData.iss;
+  const validIssuers = ['accounts.google.com', 'https://accounts.google.com'];
+
+  const validatedAudiences = Array.from(
+    new Set([
+      ...tokenAudiences.filter(Boolean),
+      ...tokenAuthorizedParty.filter(Boolean),
+    ])
+  );
+
+  const audienceMatches = validatedAudiences.some(aud => GOOGLE_CLIENT_IDS.includes(aud));
+  if (!audienceMatches) {
+    const error = new Error('Invalid token audience');
+    error.code = 'INVALID_TOKEN_AUDIENCE';
+    error.details = {
+      expected: GOOGLE_CLIENT_IDS,
+      actualAud: tokenData.aud,
+      actualAzp: tokenData.azp,
+    };
+    throw error;
+  }
+
+  if (!validIssuers.includes(tokenIssuer)) {
+    const error = new Error('Invalid token issuer');
+    error.code = 'INVALID_TOKEN_ISSUER';
+    error.details = { issuer: tokenIssuer };
+    throw error;
+  }
+
+  return tokenData;
+}
+
 // Google OAuth configuration
 const DEFAULT_GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '638788559518-has2jchutlob4bj1cud789u2vjs13pkv.apps.googleusercontent.com';
 const configuredGoogleClientIds = process.env.GOOGLE_CLIENT_IDS
@@ -306,8 +343,10 @@ const io = socketIO(server, {
     methods: ['GET', 'POST'],
   },
   
-  // ✅ OPTIMIZED: Transport options
-  transports: ['websocket', 'polling'],
+  // ✅ OPTIMIZED: Transport options - prefer WebSocket only to avoid polling/backpressure
+  transports: ['websocket'],
+  // Allow older engine.io v3 clients (mobile clients may use older engines)
+  allowEIO3: true,
   
   // ✅ OPTIMIZED: Connection timing
   pingInterval: 10000,  // Check connection every 10s (was 15s)
@@ -345,6 +384,7 @@ const userSchema = new mongoose.Schema({
   userId: { type: String, unique: true, required: true, index: true },
   userName: { type: String, required: true, index: true },
   email: { type: String, unique: true, sparse: true, index: true, lowercase: true },
+  passwordHash: { type: String, default: null },
   authType: { type: String, enum: ['GOOGLE_OAUTH', 'LOCAL', 'GUEST'], default: 'LOCAL', index: true },
   isGuest: { type: Boolean, default: false, index: true },
   
@@ -498,15 +538,15 @@ app.post('/auth/validate-token', validateTokenLimiter, asyncHandler(async (req, 
     // Validate token with Google's API
     let tokenData;
     try {
-      tokenData = await fetchGoogleTokenInfo(idToken);
+      tokenData = await validateGoogleIdToken(idToken);
     } catch (fetchErr) {
       Logger.warn(
         'oauth/validate',
         'Token validation failed',
         {
           message: fetchErr.message,
-          statusCode: fetchErr.statusCode,
-          responseBody: fetchErr.responseBody,
+          code: fetchErr.code,
+          details: fetchErr.details,
         }
       );
       return sendError(res, 401, 'Invalid or expired token', 'INVALID_TOKEN');
@@ -702,6 +742,7 @@ app.post('/auth/register', registerLimiter, validateRegistration, asyncHandler(a
       userId,
       userName,
       email,
+      passwordHash: hashedPassword,
       authType: 'LOCAL',
       isGuest: false,
       gender: gender || 'other',
@@ -738,19 +779,60 @@ app.post('/auth/login', loginLimiter, validateAuth, asyncHandler(async (req, res
     return sendError(res, 503, 'Database not connected', 'DB_NOT_CONNECTED');
   }
   try {
-    const { userId, email, password } = req.body;
+    const { userId, email, password, idToken } = req.body;
 
-    if (!userId && !email) {
-      return sendError(res, 400, 'userId or email is required');
+    if (!idToken && !password) {
+      return sendError(res, 400, 'Either idToken or password is required', 'VALIDATION_ERROR');
     }
 
-    // Find user
-    const user = await User.findOne({
-      $or: [{ userId }, { email }],
-    });
+    let user = null;
 
-    if (!user) {
-      return sendError(res, 404, 'User not found', 'USER_NOT_FOUND');
+    if (idToken) {
+      let tokenData;
+      try {
+        tokenData = await validateGoogleIdToken(idToken);
+      } catch (tokenErr) {
+        Logger.warn('auth/login', 'Google ID token validation failed', {
+          message: tokenErr.message,
+          code: tokenErr.code,
+          details: tokenErr.details,
+        });
+        return sendError(res, 401, 'Invalid Google ID token', tokenErr.code || 'INVALID_TOKEN');
+      }
+
+      const tokenUserId = tokenData.sub;
+      const tokenEmail = tokenData.email ? String(tokenData.email).toLowerCase() : null;
+
+      user = await User.findOne({
+        $or: [{ userId: tokenUserId }, { email: tokenEmail }],
+      });
+
+      if (!user) {
+        return sendError(res, 404, 'Google user not found', 'USER_NOT_FOUND');
+      }
+
+      if (user.authType !== 'GOOGLE_OAUTH') {
+        return sendError(res, 403, 'User exists but is not a Google-authenticated account', 'AUTH_TYPE_MISMATCH');
+      }
+    } else {
+      const lookupQuery = { $or: [{ userId }, { email }] };
+      user = await User.findOne(lookupQuery);
+      if (!user) {
+        return sendError(res, 404, 'User not found', 'USER_NOT_FOUND');
+      }
+
+      if (user.authType !== 'LOCAL') {
+        return sendError(res, 403, 'Password login is only allowed for LOCAL accounts', 'AUTH_TYPE_MISMATCH');
+      }
+
+      if (!user.passwordHash) {
+        return sendError(res, 403, 'No password set for this account', 'PASSWORD_NOT_SET');
+      }
+
+      const passwordMatches = await bcrypt.compare(password, user.passwordHash);
+      if (!passwordMatches) {
+        return sendError(res, 401, 'Invalid credentials', 'INVALID_CREDENTIALS');
+      }
     }
 
     // Update last login
@@ -1714,7 +1796,7 @@ function decomposeRoom(socketId, roomType = 'video') {
       }
 
       // Notify peer
-      io.to(peerId).emit('partner_left', {
+      io.volatile.to(peerId).emit('partner_left', {
         reason: 'partner_left',
         timestamp: Date.now(),
       });
@@ -1964,12 +2046,13 @@ async function attemptMatch(roomType = 'video') {
     // This ensures client waits for server confirmation before showing animation
     setImmediate(() => {
       try {
-        io.to(user1.socketId).emit('connection_ready', {
+        // connection_ready is advisory; use volatile to avoid buffering if client is slow
+        io.volatile.to(user1.socketId).emit('connection_ready', {
           matchId,
           peerId: user2.socketId,
           readyAt: Date.now(),
         });
-        io.to(user2.socketId).emit('connection_ready', {
+        io.volatile.to(user2.socketId).emit('connection_ready', {
           matchId,
           peerId: user1.socketId,
           readyAt: Date.now(),
@@ -2002,8 +2085,9 @@ function broadcastStats() {
       totalOnline: socketMetadata.size,
     };
 
-    io.emit('stats', stats);
-    io.emit('online_count', stats.totalOnline);
+    // Use volatile emits for high-frequency/non-critical telemetry to avoid building up server-side buffers
+    io.volatile.emit('stats', stats);
+    io.volatile.emit('online_count', stats.totalOnline);
   } catch (error) {
     Logger.error('broadcastStats', 'Error broadcasting stats', error.message);
   }
@@ -2018,6 +2102,17 @@ const MESSAGE_CACHE_TIMEOUT = 30000; // 30 seconds
 io.on('connection', (socket) => {
   Logger.info('connection', '🟢 Client connected', { socketId: socket.id });
   health.updateSocketConnections(io.of('/').sockets.size);
+
+  // Try to disable Nagle (TCP_NODELAY) to reduce buffering/delays on slow networks
+  try {
+    const transportSocket = socket.conn && socket.conn.transport && socket.conn.transport.socket;
+    if (transportSocket && typeof transportSocket.setNoDelay === 'function') {
+      transportSocket.setNoDelay(true);
+      Logger.info('connection', '✅ TCP_NODELAY (setNoDelay) enabled on socket', { socketId: socket.id });
+    }
+  } catch (err) {
+    Logger.warn('connection', 'Could not set TCP_NODELAY on socket', { socketId: socket.id, error: err && err.message });
+  }
 
   // ✅ NEW: Add error handler to catch transport errors early
   socket.on('error', (error) => {
@@ -2183,8 +2278,9 @@ io.on('connection', (socket) => {
         if (room.memberIds && room.memberIds.includes(userId) && room.status === 'active') {
           for (const memberId of room.memberIds) {
             const memberSocketId = userSockets.get(memberId);
-            if (memberSocketId) {
-              io.to(memberSocketId).emit('room_member_updated', {
+              if (memberSocketId) {
+              // Use volatile emit for status updates to avoid buffering on slow clients
+              io.volatile.to(memberSocketId).emit('room_member_updated', {
                 roomId: room.roomId,
                 userId,
                 status: { micOn, cameraOn },
@@ -2288,7 +2384,8 @@ io.on('connection', (socket) => {
 
       // Broadcast updated public rooms list
       if (roomType === 'public') {
-        io.emit('rooms_updated', { type: 'public', rooms: Array.from(rooms.values()).filter(r => r.roomType === 'public' && r.status === 'active') });
+        // Use volatile broadcast for rooms list updates to avoid queuing when many clients are slow
+        io.volatile.emit('rooms_updated', { type: 'public', rooms: Array.from(rooms.values()).filter(r => r.roomType === 'public' && r.status === 'active') });
       }
     } catch (error) {
       Logger.error('create_room', 'Error creating room', error.message);
@@ -2448,7 +2545,8 @@ io.on('connection', (socket) => {
           if (memberSocketId) {
             setImmediate(() => {
               try {
-                io.to(memberSocketId).emit('room_member_list_updated', {
+                // Use volatile emit for room updates to avoid buffering on slow clients
+                io.volatile.to(memberSocketId).emit('room_member_list_updated', {
                   roomId: room.roomId,
                   memberIds: room.memberIds,
                   memberDetails: completeMemberDetails,
@@ -2667,7 +2765,7 @@ io.on('connection', (socket) => {
       // Check if already paired
       if (pairings.has(socket.id)) {
         Logger.info('find_partner', 'User already paired', { socketId: socket.id, roomType });
-        socket.emit('already_paired', {
+        socket.volatile.emit('already_paired', {
           message: 'You are already in a conversation. End it before starting a new one.',
         });
         return;
@@ -2676,7 +2774,7 @@ io.on('connection', (socket) => {
       // ✅ NEW: Check if already in queue to prevent duplicates
       if (queue.some((item) => item.socketId === socket.id)) {
         Logger.warn('find_partner', 'User already in queue', { socketId: socket.id, roomType });
-        socket.emit('queued', {
+        socket.volatile.emit('queued', {
           queuePosition: queue.findIndex((item) => item.socketId === socket.id) + 1,
           type: roomType,
         });
@@ -2713,7 +2811,7 @@ io.on('connection', (socket) => {
         queueSize: queue.length,
       });
 
-      socket.emit('queued', {
+      socket.volatile.emit('queued', {
         queuePosition: queue.length,
         type: roomType,
       });
@@ -2822,7 +2920,7 @@ io.on('connection', (socket) => {
       });
       socketQueues.set(socket.id, 'chat');
 
-      socket.emit('queued', {
+      socket.volatile.emit('queued', {
         type: 'chat',
         queuePosition: chatQueue.length,
       });
