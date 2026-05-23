@@ -16,15 +16,16 @@ const { sendError } = require('../utils/responseHandler');
  */
 function validateAuth(req, res, next) {
   try {
-    const { idToken, email, password } = req.body;
+    const { idToken, email, password, userId } = req.body;
 
-    if (!idToken && (!email || !password)) {
+    if (!idToken && (!password || (!email && !userId))) {
       return sendError(res, 400, 'Missing required authentication fields', 'VALIDATION_ERROR');
     }
 
     // Sanitize inputs
     req.body = {
       idToken: idToken ? String(idToken).trim() : null,
+      userId: userId ? String(userId).trim() : null,
       email: email ? String(email).toLowerCase().trim() : null,
       password: password ? String(password) : null,
       googleUserData: req.body.googleUserData || null,
@@ -46,8 +47,8 @@ function validateRegistration(req, res, next) {
   try {
     const { userId, userName, email, password } = req.body;
 
-    if (!userId || !userName || !email) {
-      return sendError(res, 400, 'Missing required fields: userId, userName, email', 'VALIDATION_ERROR');
+    if (!userName || !email || !password) {
+      return sendError(res, 400, 'Missing required fields: userName, email, password', 'VALIDATION_ERROR');
     }
 
     // Validate email format
@@ -56,20 +57,29 @@ function validateRegistration(req, res, next) {
       return sendError(res, 400, 'Invalid email format', 'VALIDATION_ERROR');
     }
 
+    if (typeof password !== 'string' || password.length < 6) {
+      return sendError(res, 400, 'Password must be at least 6 characters', 'VALIDATION_ERROR');
+    }
+
     // Validate username length
     if (userName.length < 2 || userName.length > 50) {
       return sendError(res, 400, 'Username must be 2-50 characters', 'VALIDATION_ERROR');
     }
 
     // Sanitize inputs
+    const safeUserId = userId ? String(userId).trim() : '';
     req.body = {
-      userId: String(userId).trim(),
+      userId: safeUserId,
       userName: String(userName).trim(),
       email: String(email).toLowerCase().trim(),
       password: password ? String(password) : null,
       gender: req.body.gender || 'other',
       country: req.body.country || null,
       avatarColor: req.body.avatarColor || '#128C7E',
+      birthDate: req.body.birthDate ? String(req.body.birthDate).trim() : null,
+      profileImageUrl: req.body.profileImageUrl ? String(req.body.profileImageUrl).trim() : null,
+      pictureName: req.body.pictureName ? String(req.body.pictureName).trim() : null,
+      emailVerified: req.body.emailVerified === true,
     };
 
     Logger.debug('validation', 'Registration request validated');

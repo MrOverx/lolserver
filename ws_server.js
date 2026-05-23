@@ -75,43 +75,6 @@ async function fetchGoogleTokenInfo(idToken) {
   });
 }
 
-async function validateGoogleIdToken(idToken) {
-  const tokenData = await fetchGoogleTokenInfo(idToken);
-
-  const tokenAudiences = Array.isArray(tokenData.aud) ? tokenData.aud : [tokenData.aud];
-  const tokenAuthorizedParty = tokenData.azp ? [tokenData.azp] : [];
-  const tokenIssuer = tokenData.iss;
-  const validIssuers = ['accounts.google.com', 'https://accounts.google.com'];
-
-  const validatedAudiences = Array.from(
-    new Set([
-      ...tokenAudiences.filter(Boolean),
-      ...tokenAuthorizedParty.filter(Boolean),
-    ])
-  );
-
-  const audienceMatches = validatedAudiences.some(aud => GOOGLE_CLIENT_IDS.includes(aud));
-  if (!audienceMatches) {
-    const error = new Error('Invalid token audience');
-    error.code = 'INVALID_TOKEN_AUDIENCE';
-    error.details = {
-      expected: GOOGLE_CLIENT_IDS,
-      actualAud: tokenData.aud,
-      actualAzp: tokenData.azp,
-    };
-    throw error;
-  }
-
-  if (!validIssuers.includes(tokenIssuer)) {
-    const error = new Error('Invalid token issuer');
-    error.code = 'INVALID_TOKEN_ISSUER';
-    error.details = { issuer: tokenIssuer };
-    throw error;
-  }
-
-  return tokenData;
-}
-
 // Google OAuth configuration
 const DEFAULT_GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '638788559518-has2jchutlob4bj1cud789u2vjs13pkv.apps.googleusercontent.com';
 const configuredGoogleClientIds = process.env.GOOGLE_CLIENT_IDS
@@ -131,6 +94,8 @@ const { sendError, sendSuccess } = require('./utils/responseHandler');
 const { validateUserData } = require('./utils/userRegistration');
 const { userCache } = require('./utils/userCache');
 const { mongoDBManager } = require('./utils/mongoDBManager');
+const { sendOtpEmail, isEmailConfigured } = require('./utils/emailService');
+const { createOtpForEmail, verifyOtpForEmail, startOtpCleanup } = require('./utils/otpStore');
 const cors = require('cors');
 
 // ✅ Import enhancement middleware
@@ -192,6 +157,7 @@ health.startMonitoring(60);
 
 // ✅ Start rate limit cleanup
 startCleanupInterval();
+startOtpCleanup();
 
 // ========== MONGODB CONNECTION CONSTANTS ==========
 // 🔐 MongoDB Atlas Connection String (from environment variable)
@@ -384,7 +350,6 @@ const userSchema = new mongoose.Schema({
   userId: { type: String, unique: true, required: true, index: true },
   userName: { type: String, required: true, index: true },
   email: { type: String, unique: true, sparse: true, index: true, lowercase: true },
-  passwordHash: { type: String, default: null },
   authType: { type: String, enum: ['GOOGLE_OAUTH', 'LOCAL', 'GUEST'], default: 'LOCAL', index: true },
   isGuest: { type: Boolean, default: false, index: true },
   
@@ -398,9 +363,13 @@ const userSchema = new mongoose.Schema({
   avatarColor: { type: String, default: '#128C7E' },
   avatarLetter: { type: String, default: 'U' },
   profileImageUrl: { type: String, default: null },
+  passwordHash: { type: String, default: null },
   useColorProfile: { type: Boolean, default: true },
   pictureName: { type: String, default: null },
-  
+  emailVerified: { type: Boolean, default: false, index: true },
+  emailVerifiedAt: { type: Date, default: null },
+  expiresAt: { type: Date, default: null, index: true },
+
   // Stats & achievements
   xp: { type: Map, of: Number, default: {} },
   
@@ -416,6 +385,7 @@ userSchema.index({ isActive: 1, createdAt: -1 }); // Get active users by creatio
 userSchema.index({ country: 1, isActive: 1 }); // Find users by country
 userSchema.index({ authType: 1, isActive: 1 }); // Auth type filtering
 userSchema.index({ email: 1, isGuest: 1 }); // Email lookups
+userSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0, sparse: true }); // Guest account TTL cleanup
 
 // ✅ Helper function to normalize xp output (handles legacy starCount fallback)
 function getUserXp(user) {
@@ -538,15 +508,15 @@ app.post('/auth/validate-token', validateTokenLimiter, asyncHandler(async (req, 
     // Validate token with Google's API
     let tokenData;
     try {
-      tokenData = await validateGoogleIdToken(idToken);
+      tokenData = await fetchGoogleTokenInfo(idToken);
     } catch (fetchErr) {
       Logger.warn(
         'oauth/validate',
         'Token validation failed',
         {
           message: fetchErr.message,
-          code: fetchErr.code,
-          details: fetchErr.details,
+          statusCode: fetchErr.statusCode,
+          responseBody: fetchErr.responseBody,
         }
       );
       return sendError(res, 401, 'Invalid or expired token', 'INVALID_TOKEN');
@@ -719,41 +689,60 @@ app.post('/auth/register', registerLimiter, validateRegistration, asyncHandler(a
     return sendError(res, 503, 'Database not connected', 'DB_NOT_CONNECTED');
   }
   try {
-    const { userId, userName, email, password, gender, country, avatarColor } = req.body;
+    const {
+      userId: requestedUserId,
+      userName,
+      email,
+      password,
+      gender,
+      country,
+      avatarColor,
+      birthDate,
+      profileImageUrl,
+      pictureName,
+      emailVerified,
+    } = req.body;
 
-    if (!userId || !userName || !email) {
-      return sendError(res, 400, 'userId, userName, and email are required');
+    if (!userName || !email || !password) {
+      return sendError(res, 400, 'userName, email, and password are required', 'VALIDATION_ERROR');
     }
 
-    // Check if user already exists
-    const existingUser = await User.findOne({ $or: [{ userId }, { email }] });
+    const normalizedEmail = String(email).toLowerCase().trim();
+    const newUserId = requestedUserId && String(requestedUserId).trim().length > 0
+      ? String(requestedUserId).trim()
+      : `local_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+
+    // Check if user already exists by email or generated userId
+    const existingUser = await User.findOne({ $or: [{ userId: newUserId }, { email: normalizedEmail }] });
     if (existingUser) {
       return sendError(res, 409, 'User already exists', 'USER_EXISTS');
     }
 
-    // Hash password if provided
-    let hashedPassword = null;
-    if (password) {
-      hashedPassword = await bcrypt.hash(password, 10);
-    }
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const birthDateValue = birthDate ? new Date(String(birthDate)) : null;
 
-    // Create new user
     const newUser = new User({
-      userId,
-      userName,
-      email,
+      userId: newUserId,
+      userName: String(userName).trim(),
+      email: normalizedEmail,
       passwordHash: hashedPassword,
       authType: 'LOCAL',
       isGuest: false,
-      gender: gender || 'other',
+      gender: gender ? String(gender).toLowerCase() : 'other',
       country: country || null,
+      birthDate: birthDateValue,
       avatarColor: avatarColor || '#128C7E',
+      profileImageUrl: profileImageUrl || null,
+      pictureName: pictureName || null,
+      emailVerified: emailVerified === true,
+      emailVerifiedAt: emailVerified === true ? new Date() : null,
+      profileComplete: true,
       lastLogin: new Date(),
     });
 
     await newUser.save();
 
-    Logger.info('auth/register', '✅ New user registered', { userId, email });
+    Logger.info('auth/register', '✅ New user registered', { userId: newUserId, email: normalizedEmail });
 
     return sendSuccess(res, {
       user: {
@@ -779,63 +768,45 @@ app.post('/auth/login', loginLimiter, validateAuth, asyncHandler(async (req, res
     return sendError(res, 503, 'Database not connected', 'DB_NOT_CONNECTED');
   }
   try {
-    const { userId, email, password, idToken } = req.body;
+    const { userId, email, password } = req.body;
+    const normalizedEmail = email ? String(email).toLowerCase().trim() : null;
 
-    if (!idToken && !password) {
-      return sendError(res, 400, 'Either idToken or password is required', 'VALIDATION_ERROR');
+    Logger.debug('auth/login', 'Login request received', {
+      userId: userId ? String(userId).trim() : null,
+      email: normalizedEmail ? normalizedEmail.replace(/(.{2}).+@/, '$1***@') : null,
+    });
+
+    if (!userId && !normalizedEmail) {
+      return sendError(res, 400, 'userId or email is required');
     }
 
-    let user = null;
-
-    if (idToken) {
-      let tokenData;
-      try {
-        tokenData = await validateGoogleIdToken(idToken);
-      } catch (tokenErr) {
-        Logger.warn('auth/login', 'Google ID token validation failed', {
-          message: tokenErr.message,
-          code: tokenErr.code,
-          details: tokenErr.details,
-        });
-        return sendError(res, 401, 'Invalid Google ID token', tokenErr.code || 'INVALID_TOKEN');
-      }
-
-      const tokenUserId = tokenData.sub;
-      const tokenEmail = tokenData.email ? String(tokenData.email).toLowerCase() : null;
-
-      user = await User.findOne({
-        $or: [{ userId: tokenUserId }, { email: tokenEmail }],
-      });
-
-      if (!user) {
-        return sendError(res, 404, 'Google user not found', 'USER_NOT_FOUND');
-      }
-
-      if (user.authType !== 'GOOGLE_OAUTH') {
-        return sendError(res, 403, 'User exists but is not a Google-authenticated account', 'AUTH_TYPE_MISMATCH');
-      }
-    } else {
-      const lookupQuery = { $or: [{ userId }, { email }] };
-      user = await User.findOne(lookupQuery);
-      if (!user) {
-        return sendError(res, 404, 'User not found', 'USER_NOT_FOUND');
-      }
-
-      if (user.authType !== 'LOCAL') {
-        return sendError(res, 403, 'Password login is only allowed for LOCAL accounts', 'AUTH_TYPE_MISMATCH');
-      }
-
-      if (!user.passwordHash) {
-        return sendError(res, 403, 'No password set for this account', 'PASSWORD_NOT_SET');
-      }
-
-      const passwordMatches = await bcrypt.compare(password, user.passwordHash);
-      if (!passwordMatches) {
-        return sendError(res, 401, 'Invalid credentials', 'INVALID_CREDENTIALS');
-      }
+    if (!password) {
+      return sendError(res, 400, 'Password is required', 'VALIDATION_ERROR');
     }
 
-    // Update last login
+    const lookup = { $or: [] };
+    if (userId) lookup.$or.push({ userId: String(userId).trim() });
+    if (normalizedEmail) lookup.$or.push({ email: normalizedEmail });
+
+    if (lookup.$or.length === 0) {
+      return sendError(res, 400, 'userId or email is required');
+    }
+
+    const user = await User.findOne(lookup);
+
+    if (!user) {
+      return sendError(res, 404, 'User not found', 'USER_NOT_FOUND');
+    }
+
+    if (!user.passwordHash) {
+      return sendError(res, 401, 'Invalid email or password', 'INVALID_CREDENTIALS');
+    }
+
+    const validPassword = await bcrypt.compare(password, user.passwordHash);
+    if (!validPassword) {
+      return sendError(res, 401, 'Invalid email or password', 'INVALID_CREDENTIALS');
+    }
+
     user.lastLogin = new Date();
     await user.save();
 
@@ -860,6 +831,172 @@ app.post('/auth/login', loginLimiter, validateAuth, asyncHandler(async (req, res
   } catch (err) {
     Logger.error('auth/login', 'Error during login', err.message);
     return sendError(res, 500, 'Login error', { details: err.message });
+  }
+}));
+
+const sendOtpLimiter = createRateLimiter('send-otp', 5, 15 * 60); // 5 per 15 minutes
+const verifyOtpLimiter = createRateLimiter('verify-otp', 10, 15 * 60); // 10 per 15 minutes
+
+app.post('/auth/send-otp', sendOtpLimiter, asyncHandler(async (req, res) => {
+  if (!isDatabaseConnected()) {
+    return sendError(res, 503, 'Database not connected', 'DB_NOT_CONNECTED');
+  }
+
+  if (!isEmailConfigured()) {
+    return sendError(res, 503, 'OTP email service is not configured', 'OTP_CONFIG_ERROR');
+  }
+
+  const { email } = req.body;
+  if (!email || typeof email !== 'string' || email.trim() === '') {
+    return sendError(res, 400, 'Email is required', 'INVALID_EMAIL');
+  }
+
+  try {
+    const normalizedEmail = String(email).toLowerCase().trim();
+    const otp = await createOtpForEmail(normalizedEmail);
+
+    sendOtpEmail(normalizedEmail, otp)
+      .then((info) => {
+        Logger.info('auth/send-otp', 'OTP email queued for delivery', {
+          to: normalizedEmail,
+          messageId: info.messageId,
+        });
+      })
+      .catch((sendError) => {
+        Logger.error(
+          'auth/send-otp',
+          'OTP email delivery failed after response was returned',
+          sendError?.message || sendError,
+        );
+      });
+
+    return sendSuccess(res, {
+      email: normalizedEmail,
+      expiresIn: Number(process.env.OTP_EXPIRE_SECONDS || 300),
+    }, 'OTP requested. Check your email shortly.');
+  } catch (err) {
+    const message = err?.message || 'Unable to send OTP';
+    Logger.error('auth/send-otp', 'Error sending OTP', message);
+
+    if (err?.code === 'OTP_RESEND_WAIT') {
+      return sendError(res, 429, message, {
+        code: 'OTP_RESEND_WAIT',
+        resetTime: new Date(err.resetTime).toISOString(),
+      });
+    }
+
+    return sendError(res, 500, message, 'OTP_SEND_ERROR');
+  }
+}));
+
+app.post('/auth/verify-otp', verifyOtpLimiter, asyncHandler(async (req, res) => {
+  if (!isDatabaseConnected()) {
+    return sendError(res, 503, 'Database not connected', 'DB_NOT_CONNECTED');
+  }
+
+  const { email, otp } = req.body;
+  if (!email || typeof email !== 'string' || email.trim() === '') {
+    return sendError(res, 400, 'Email is required', 'INVALID_EMAIL');
+  }
+
+  if (!otp || typeof otp !== 'string' || otp.trim().length === 0) {
+    return sendError(res, 400, 'OTP is required', 'INVALID_OTP');
+  }
+
+  const normalizedEmail = String(email).toLowerCase().trim();
+  const result = await verifyOtpForEmail(normalizedEmail, otp.trim());
+
+  if (!result.success) {
+    const reason = result.reason || 'OTP_INVALID';
+    const message = reason === 'OTP_EXPIRED'
+      ? 'OTP expired. Please request a new one.'
+      : reason === 'OTP_TOO_MANY_ATTEMPTS'
+        ? 'Too many verification attempts. Please request a new OTP.'
+        : 'OTP did not match. Please try again.';
+
+    return sendError(res, 400, message, reason);
+  }
+
+  return sendSuccess(res, { verified: true }, 'OTP verified successfully');
+}));
+
+const forgotPasswordLimiter = createRateLimiter('forgot-password', 5, 15 * 60);
+const resetPasswordLimiter = createRateLimiter('reset-password', 5, 15 * 60);
+
+app.post('/auth/forgot-password', forgotPasswordLimiter, asyncHandler(async (req, res) => {
+  if (!isDatabaseConnected()) {
+    return sendError(res, 503, 'Database not connected', 'DB_NOT_CONNECTED');
+  }
+
+  const { email } = req.body;
+  if (!email || typeof email !== 'string' || email.trim() === '') {
+    return sendError(res, 400, 'Email is required', 'INVALID_EMAIL');
+  }
+
+  const normalizedEmail = String(email).toLowerCase().trim();
+  const user = await User.findOne({ email: normalizedEmail }).lean();
+
+  if (!user) {
+    Logger.info('auth/forgot-password', 'Password reset request for unknown email', { email: normalizedEmail });
+  }
+
+  try {
+    const otp = await createOtpForEmail(normalizedEmail);
+    await sendOtpEmail(normalizedEmail, otp);
+    return sendSuccess(res, { email: normalizedEmail }, 'Password reset OTP sent if the email is registered');
+  } catch (err) {
+    Logger.error('auth/forgot-password', 'Error sending password reset OTP', err.message);
+    return sendError(res, 500, 'Unable to send password reset OTP', 'OTP_SEND_ERROR');
+  }
+}));
+
+app.post('/auth/reset-password', resetPasswordLimiter, asyncHandler(async (req, res) => {
+  if (!isDatabaseConnected()) {
+    return sendError(res, 503, 'Database not connected', 'DB_NOT_CONNECTED');
+  }
+
+  const { email, otp, newPassword } = req.body;
+  if (!email || typeof email !== 'string' || email.trim() === '') {
+    return sendError(res, 400, 'Email is required', 'INVALID_EMAIL');
+  }
+  if (!otp || typeof otp !== 'string' || otp.trim() === '') {
+    return sendError(res, 400, 'OTP is required', 'INVALID_OTP');
+  }
+  if (!newPassword || typeof newPassword !== 'string' || newPassword.length < 6) {
+    return sendError(res, 400, 'New password must be at least 6 characters', 'INVALID_PASSWORD');
+  }
+
+  const normalizedEmail = String(email).toLowerCase().trim();
+  const result = await verifyOtpForEmail(normalizedEmail, otp.trim());
+  if (!result.success) {
+    const reason = result.reason || 'OTP_INVALID';
+    const message = reason === 'OTP_EXPIRED'
+      ? 'OTP expired. Please request a new one.'
+      : reason === 'OTP_TOO_MANY_ATTEMPTS'
+        ? 'Too many verification attempts. Please request a new OTP.'
+        : 'OTP did not match. Please try again.';
+
+    return sendError(res, 400, message, reason);
+  }
+
+  const user = await User.findOne({ email: normalizedEmail });
+  if (!user) {
+    return sendError(res, 404, 'Email is not registered', 'USER_NOT_FOUND');
+  }
+
+  try {
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    user.passwordHash = hashedPassword;
+    user.emailVerified = true;
+    user.emailVerifiedAt = new Date();
+    user.updatedAt = new Date();
+    await user.save();
+
+    Logger.info('auth/reset-password', 'Password reset successfully', { email: normalizedEmail, userId: user.userId });
+    return sendSuccess(res, { email: normalizedEmail }, 'Password reset successfully');
+  } catch (err) {
+    Logger.error('auth/reset-password', 'Error resetting password', err.message);
+    return sendError(res, 500, 'Unable to reset password', 'RESET_PASSWORD_ERROR');
   }
 }));
 
@@ -1796,7 +1933,7 @@ function decomposeRoom(socketId, roomType = 'video') {
       }
 
       // Notify peer
-      io.volatile.to(peerId).emit('partner_left', {
+      io.to(peerId).emit('partner_left', {
         reason: 'partner_left',
         timestamp: Date.now(),
       });
@@ -2765,7 +2902,7 @@ io.on('connection', (socket) => {
       // Check if already paired
       if (pairings.has(socket.id)) {
         Logger.info('find_partner', 'User already paired', { socketId: socket.id, roomType });
-        socket.volatile.emit('already_paired', {
+        socket.emit('already_paired', {
           message: 'You are already in a conversation. End it before starting a new one.',
         });
         return;
@@ -2774,7 +2911,7 @@ io.on('connection', (socket) => {
       // ✅ NEW: Check if already in queue to prevent duplicates
       if (queue.some((item) => item.socketId === socket.id)) {
         Logger.warn('find_partner', 'User already in queue', { socketId: socket.id, roomType });
-        socket.volatile.emit('queued', {
+        socket.emit('queued', {
           queuePosition: queue.findIndex((item) => item.socketId === socket.id) + 1,
           type: roomType,
         });
@@ -2811,7 +2948,7 @@ io.on('connection', (socket) => {
         queueSize: queue.length,
       });
 
-      socket.volatile.emit('queued', {
+      socket.emit('queued', {
         queuePosition: queue.length,
         type: roomType,
       });
@@ -2920,7 +3057,7 @@ io.on('connection', (socket) => {
       });
       socketQueues.set(socket.id, 'chat');
 
-      socket.volatile.emit('queued', {
+      socket.emit('queued', {
         type: 'chat',
         queuePosition: chatQueue.length,
       });
@@ -3273,22 +3410,42 @@ io.on('connection', (socket) => {
   // ✅ NEW: Handle direct messages with proper routing and offline storage
   socket.on('send_direct_message', (data) => {
     try {
-      const { recipientId, content, messageId } = data;
+      const { recipientId, content, message, text, messageId } = data;
       const senderMeta = socketMetadata.get(socket.id) || {};
       const senderId = senderMeta.userId;
+      const messageText = content || message || text || '';
+      const mediaUrl = data.mediaUrl || data.gifUrl || data.media || data.image || data.media_url || null;
+      const mediaType = data.mediaType || data.type || data.gifType || data.media_type || null;
+      const finalMessageId = messageId || `msg_${Date.now()}`;
       
       if (!senderId || !recipientId) {
         Logger.warn('send_direct_message', 'Missing senderId or recipientId', { senderId, recipientId });
         return;
       }
 
+      const mediaFallback = mediaUrl
+        ? (mediaType === 'gif'
+            ? 'GIF'
+            : mediaType === 'image'
+                ? 'Image'
+                : mediaType === 'video'
+                    ? 'Video'
+                    : 'Media')
+        : '';
+
       // Build message payload
       const messagePayload = {
-        id: messageId || `msg_${Date.now()}`,
+        id: finalMessageId,
+        messageId: finalMessageId,
         senderId,
         senderName: senderMeta.userName || 'Unknown',
         recipientId,
-        content,
+        message: messageText,
+        content: messageText || mediaFallback,
+        text: messageText || mediaFallback,
+        mediaUrl,
+        mediaType,
+        replyTo: data.replyTo || null,
         profileImagePath: senderMeta.profileImagePath,
         senderProfileImagePath: senderMeta.profileImagePath,
         avatarColor: senderMeta.avatarColor || '#128C7E',

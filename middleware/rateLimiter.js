@@ -84,7 +84,12 @@ function createRateLimiter(name, maxRequests, windowSizeSeconds = 1800) {
         res,
         429,
         `Too many ${name} attempts. Reset at ${resetTime}`,
-        'RATE_LIMIT_EXCEEDED'
+        {
+          code: 'RATE_LIMIT_EXCEEDED',
+          count: record.count,
+          limit: maxRequests,
+          resetTime,
+        }
       );
     }
   };

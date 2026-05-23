@@ -11,17 +11,17 @@
   "license": "ISC",
   "description": "OmegleLOL WebSocket Server with MongoDB Backend",
   "dependencies": {
-    "express": "^5.2.1",
-    "socket.io": "^4.8.3",
-    "mongoose": "^7.5.0",
     "bcryptjs": "^2.4.3",
-    "dotenv": "^16.3.1",
-    "cors": "^2.8.5",
     "compression": "^1.7.4",
-    "helmet": "^7.1.0"
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^5.2.1",
+    "helmet": "^7.1.0",
+    "mongoose": "^7.5.0",
+    "nodemailer": "^6.10.1",
+    "socket.io": "^4.8.3"
   },
   "devDependencies": {
     "nodemon": "^3.1.11"
   }
 }
-
