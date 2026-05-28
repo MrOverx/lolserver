@@ -112,17 +112,39 @@ Logger.setLevel(process.env.NODE_ENV === 'development' ? Logger.LOG_LEVELS.DEBUG
 const app = express();
 const server = http.createServer(app);
 
-const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
+let ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(origin => origin.trim()).filter(Boolean)
-  : ['*'];
+  : [];
+
+// Backwards-compatible developer convenience: allow wildcard in development only.
+if (ALLOWED_ORIGINS.length === 0) {
+  // If no origins specified, default to a strict empty list in production
+  if (process.env.NODE_ENV === 'development') {
+    ALLOWED_ORIGINS = ['http://localhost:3000', 'http://localhost:8080'];
+    Logger.info('cors', 'No ALLOWED_ORIGINS set; using development defaults', { ALLOWED_ORIGINS });
+  } else {
+    Logger.warn('cors', 'No ALLOWED_ORIGINS configured; CORS will be restricted. Set ALLOWED_ORIGINS in env to allow origins.');
+  }
+} else if (ALLOWED_ORIGINS.includes('*') && process.env.NODE_ENV !== 'development') {
+  // Prevent wildcard in non-dev to avoid accidental open CORS in production
+  Logger.warn('cors', 'Wildcard origin (*) detected in ALLOWED_ORIGINS in non-development environment. Removing wildcard for safety.');
+  ALLOWED_ORIGINS = ALLOWED_ORIGINS.filter(o => o !== '*');
+}
 
 const corsOptions = {
   origin: (origin, callback) => {
-    if (!origin || ALLOWED_ORIGINS.includes('*') || ALLOWED_ORIGINS.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error('CORS policy: Origin not allowed'));
+    // Allow same-origin or no origin (e.g., curl, server-to-server)
+    if (!origin) return callback(null, true);
+    
+    // Check string origins
+    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    
+    // In development, allow any localhost:* origin (for Flutter dev server, etc.)
+    if (process.env.NODE_ENV === 'development' && /^http:\/\/localhost(:\d+)?$/.test(origin)) {
+      return callback(null, true);
     }
+    
+    return callback(new Error('CORS policy: Origin not allowed'));
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
@@ -885,7 +907,7 @@ app.post('/auth/send-otp', sendOtpLimiter, asyncHandler(async (req, res) => {
       });
     }
 
-    return sendError(res, 500, message, 'OTP_SEND_ERROR');
+    return sendError(res, 500, message, { code: 'OTP_SEND_ERROR', details: err?.message });
   }
 }));
 
@@ -946,7 +968,7 @@ app.post('/auth/forgot-password', forgotPasswordLimiter, asyncHandler(async (req
     return sendSuccess(res, { email: normalizedEmail }, 'Password reset OTP sent if the email is registered');
   } catch (err) {
     Logger.error('auth/forgot-password', 'Error sending password reset OTP', err.message);
-    return sendError(res, 500, 'Unable to send password reset OTP', 'OTP_SEND_ERROR');
+    return sendError(res, 500, 'Unable to send password reset OTP', { code: 'OTP_SEND_ERROR', details: err?.message });
   }
 }));
 
@@ -996,7 +1018,7 @@ app.post('/auth/reset-password', resetPasswordLimiter, asyncHandler(async (req, 
     return sendSuccess(res, { email: normalizedEmail }, 'Password reset successfully');
   } catch (err) {
     Logger.error('auth/reset-password', 'Error resetting password', err.message);
-    return sendError(res, 500, 'Unable to reset password', 'RESET_PASSWORD_ERROR');
+    return sendError(res, 500, 'Unable to reset password', { code: 'RESET_PASSWORD_ERROR', details: err?.message });
   }
 }));
 
@@ -1525,6 +1547,114 @@ app.get('/friends/list', async (req, res) => {
   }
 });
 
+// ========== NEW: GET INCOMING FRIEND REQUESTS ENDPOINT ==========
+app.get('/friends/requests/incoming', async (req, res) => {
+  if (!isDatabaseConnected()) {
+    return sendError(res, 503, 'Database not available');
+  }
+
+  try {
+    const userId = req.query.userId || req.headers['x-user-id'];
+
+    if (!userId) {
+      return sendError(res, 400, 'userId is required');
+    }
+
+    // Get all incoming friend requests (where user is the recipient)
+    const incomingRequests = await Friend.find({
+      friendId: userId,
+      status: 'pending',
+    }).lean();
+
+    // Get sender user details
+    const senderIds = incomingRequests.map((r) => r.userId);
+    const senderUsers = await User.find(
+      { userId: { $in: senderIds }, isActive: true },
+      'userId userName avatarColor avatarLetter profileImageUrl gender country'
+    ).lean();
+
+    // Map requests to include sender details
+    const requestsList = incomingRequests.map((req) => {
+      const sender = senderUsers.find((u) => u.userId === req.userId);
+      return {
+        requestId: req._id.toString(),
+        userId: req.userId,
+        userName: sender?.userName || 'Unknown',
+        avatarColor: sender?.avatarColor,
+        avatarLetter: sender?.avatarLetter || (sender?.userName || 'U').charAt(0).toUpperCase(),
+        profileImageUrl: sender?.profileImageUrl,
+        gender: sender?.gender || 'other',
+        country: sender?.country || null,
+        createdAt: req.createdAt,
+      };
+    });
+
+    return res.status(200).json({
+      success: true,
+      requests: requestsList,
+      count: requestsList.length,
+    });
+
+  } catch (err) {
+    Logger.error('friends/requests/incoming', 'Error getting incoming requests', err.message);
+    return sendError(res, 500, 'Error getting incoming requests', { details: err.message });
+  }
+});
+
+// ========== NEW: GET OUTGOING FRIEND REQUESTS ENDPOINT ==========
+app.get('/friends/requests/outgoing', async (req, res) => {
+  if (!isDatabaseConnected()) {
+    return sendError(res, 503, 'Database not available');
+  }
+
+  try {
+    const userId = req.query.userId || req.headers['x-user-id'];
+
+    if (!userId) {
+      return sendError(res, 400, 'userId is required');
+    }
+
+    // Get all outgoing friend requests (where user is the sender)
+    const outgoingRequests = await Friend.find({
+      userId: userId,
+      status: 'pending',
+    }).lean();
+
+    // Get recipient user details
+    const recipientIds = outgoingRequests.map((r) => r.friendId);
+    const recipientUsers = await User.find(
+      { userId: { $in: recipientIds }, isActive: true },
+      'userId userName avatarColor avatarLetter profileImageUrl gender country'
+    ).lean();
+
+    // Map requests to include recipient details
+    const requestsList = outgoingRequests.map((req) => {
+      const recipient = recipientUsers.find((u) => u.userId === req.friendId);
+      return {
+        requestId: req._id.toString(),
+        userId: req.friendId,
+        userName: recipient?.userName || 'Unknown',
+        avatarColor: recipient?.avatarColor,
+        avatarLetter: recipient?.avatarLetter || (recipient?.userName || 'U').charAt(0).toUpperCase(),
+        profileImageUrl: recipient?.profileImageUrl,
+        gender: recipient?.gender || 'other',
+        country: recipient?.country || null,
+        createdAt: req.createdAt,
+      };
+    });
+
+    return res.status(200).json({
+      success: true,
+      requests: requestsList,
+      count: requestsList.length,
+    });
+
+  } catch (err) {
+    Logger.error('friends/requests/outgoing', 'Error getting outgoing requests', err.message);
+    return sendError(res, 500, 'Error getting outgoing requests', { details: err.message });
+  }
+});
+
 const VALID_GENDERS = ['male', 'female', 'other'];
 
 function sanitizeGenderInput(genderValue) {
@@ -1631,6 +1761,42 @@ app.post('/user/:userId/update', validateProfileUpdate, async (req, res) => {
     // ✅ PERFORMANCE: Invalidate cache so next request gets fresh data
     userCache.invalidate(userId);
 
+    // ✅ SYNC LIVE SOCKET METADATA: If the user is connected, refresh their live socket profile data
+    try {
+      const connectedSocketId = userSockets.get(userId);
+      if (connectedSocketId) {
+        const existingMeta = socketMetadata.get(connectedSocketId) || {};
+        socketMetadata.set(connectedSocketId, {
+          ...existingMeta,
+          userName: user.userName || existingMeta.userName,
+          avatarColor: user.avatarColor || existingMeta.avatarColor,
+          profileImageUrl: user.profileImageUrl || existingMeta.profileImageUrl,
+          profileImagePath: user.profileImageUrl || existingMeta.profileImagePath,
+          country: user.country || existingMeta.country,
+          gender: user.gender || existingMeta.gender,
+        });
+        Logger.info('user/update', '✅ Synchronized socket metadata for updated user', { userId, socketId: connectedSocketId });
+      }
+    } catch (syncErr) {
+      Logger.warn('user/update', 'Failed to sync socket metadata', { userId, error: syncErr && syncErr.message });
+    }
+
+    // ✅ BROADCAST: Notify connected clients of the profile change
+    try {
+      io.emit('profile_update', {
+        userId: user.userId,
+        userName: user.userName,
+        avatarColor: user.avatarColor,
+        profileImageUrl: user.profileImageUrl,
+        gender: user.gender,
+        country: user.country,
+        timestamp: Date.now(),
+      });
+      Logger.info('user/update', '✅ Broadcast profile_update to connected clients', { userId });
+    } catch (broadcastErr) {
+      Logger.warn('user/update', 'Failed to broadcast profile_update', { userId, error: broadcastErr && broadcastErr.message });
+    }
+
     Logger.info('user/update', '✅ User profile updated or created', {
       userId,
       created: user.createdAt.getTime() === user.updatedAt.getTime(),
@@ -1717,7 +1883,34 @@ const rateLimitMap = new Map(); // socketId -> { count, resetTime } for abuse pr
 // ✅ NEW: Cache profile images separately for matched events (not re-emitted in normal traffic)
 const profileImageCache = new Map(); // socketId -> profileImagePath (full data URI or URL)
 // ✅ NEW: Store offline messages to deliver when user comes online
-let offlineMessages = new Map(); // userId -> [messagePayload]
+let offlineMessages = new Map(); // userId -> [{ payload: messagePayload, ts: number }]
+// TTL for offline messages (default 7 days) - can be adjusted via env
+const OFFLINE_MESSAGE_TTL_MS = (Number(process.env.OFFLINE_MESSAGE_TTL_DAYS) || 7) * 24 * 60 * 60 * 1000;
+
+// Periodic cleanup for offlineMessages to avoid unbounded memory growth
+function startOfflineMessagesCleanup() {
+  setInterval(() => {
+    try {
+      const now = Date.now();
+      let removedCount = 0;
+      for (const [userId, list] of offlineMessages.entries()) {
+        const filtered = list.filter(item => now - item.ts <= OFFLINE_MESSAGE_TTL_MS);
+        removedCount += (list.length - filtered.length);
+        if (filtered.length > 0) {
+          offlineMessages.set(userId, filtered);
+        } else {
+          offlineMessages.delete(userId);
+        }
+      }
+      if (removedCount > 0) {
+        Logger.info('offlineMessages', 'Cleaned expired offline messages', { removedCount });
+      }
+    } catch (e) {
+      Logger.warn('offlineMessages', 'Error during offline messages cleanup', { err: e && e.message });
+    }
+  }, 60 * 60 * 1000); // run hourly
+}
+startOfflineMessagesCleanup();
 // Star gifting state: counts per room or match and one-time gift tracking
 const starCounts = new Map(); // key -> number (roomId or matchId)
 const oneTimeGifts = new Set(); // `${socketId}:${key}` to prevent duplicate gifts
@@ -1966,6 +2159,26 @@ function decomposeRoom(socketId, roomType = 'video') {
   }
 }
 
+// ✅ NEW HELPER: Fetch fresh profile from MongoDB to get latest profileImageUrl
+async function getFreshUserProfile(userId) {
+  try {
+    if (!userId) return null;
+    
+    const user = await User.findOne({ userId }).lean().select('userId userName avatarColor gender country profileImageUrl').exec();
+    
+    if (user) {
+      Logger.debug('getFreshUserProfile', 'Fetched fresh user profile', { userId, hasProfileImageUrl: !!user.profileImageUrl });
+    } else {
+      Logger.warn('getFreshUserProfile', 'User not found in MongoDB', { userId });
+    }
+    
+    return user;
+  } catch (error) {
+    Logger.error('getFreshUserProfile', 'Error fetching fresh profile', { userId, error: error.message });
+    return null;
+  }
+}
+
 async function attemptMatch(roomType = 'video') {
   try {
     const pairings = roomType === 'video' ? videoPairings : chatPairings;
@@ -1984,13 +2197,29 @@ async function attemptMatch(roomType = 'video') {
       return false;
     }
 
-    const user1 = queue.shift();
-    const user2 = queue.shift();
-
-    if (!isValidSocketId(user1?.socketId) || !isValidSocketId(user2?.socketId)) {
-      Logger.warn('attemptMatch', 'Invalid socket IDs in queue');
+    // Pop first valid user from the head of the queue
+    let user1 = null;
+    while (queue.length > 0) {
+      const candidate = queue.shift();
+      if (isValidSocketId(candidate?.socketId)) {
+        user1 = candidate;
+        break;
+      }
+      Logger.warn('attemptMatch', 'Skipping invalid socket in queue', { socketId: candidate?.socketId });
+    }
+    if (!user1) {
+      Logger.warn('attemptMatch', 'No valid user found at head of queue');
       return false;
     }
+
+    // Find a partner later in the queue to avoid shifting twice; splice out the partner when found
+    const partnerIndex = queue.findIndex(item => isValidSocketId(item?.socketId) && item.socketId !== user1.socketId);
+    if (partnerIndex === -1) {
+      // No suitable partner currently - requeue user1 to the end
+      queue.push(user1);
+      return false;
+    }
+    const user2 = queue.splice(partnerIndex, 1)[0];
     
     // ✅ CRITICAL FIX: AWAIT async blocking check instead of fire-and-forget
     const user1Blocked = user1.userData && user1.userData.userId && (await isUserBlocked(user1.userData.userId));
@@ -2046,6 +2275,32 @@ async function attemptMatch(roomType = 'video') {
 
     const user1DataValid = ensureUserData(user1.userData, user1.socketId);
     const user2DataValid = ensureUserData(user2.userData, user2.socketId);
+
+    // ✅ NEW: Fetch fresh profiles from MongoDB to get latest profileImageUrl
+    // This ensures profile images are always current, not stale socket-register data
+    const user1FreshProfile = user1DataValid.userId ? await getFreshUserProfile(user1DataValid.userId) : null;
+    const user2FreshProfile = user2DataValid.userId ? await getFreshUserProfile(user2DataValid.userId) : null;
+    
+    // Merge fresh profile data with socket metadata
+    // Fresh profile takes priority for profileImageUrl, but keep other socket data as fallback
+    if (user1FreshProfile) {
+      user1DataValid.profileImageUrl = user1FreshProfile.profileImageUrl || user1DataValid.profileImageUrl;
+      user1DataValid.userName = user1FreshProfile.userName || user1DataValid.userName;
+      user1DataValid.avatarColor = user1FreshProfile.avatarColor || user1DataValid.avatarColor;
+      user1DataValid.gender = user1FreshProfile.gender || user1DataValid.gender;
+      user1DataValid.country = user1FreshProfile.country || user1DataValid.country;
+    }
+    if (user2FreshProfile) {
+      user2DataValid.profileImageUrl = user2FreshProfile.profileImageUrl || user2DataValid.profileImageUrl;
+      user2DataValid.userName = user2FreshProfile.userName || user2DataValid.userName;
+      user2DataValid.avatarColor = user2FreshProfile.avatarColor || user2DataValid.avatarColor;
+      user2DataValid.gender = user2FreshProfile.gender || user2DataValid.gender;
+      user2DataValid.country = user2FreshProfile.country || user2DataValid.country;
+    }
+    Logger.info('attemptMatch', 'Merged fresh profiles from MongoDB', {
+      user1: { id: user1DataValid.userId, hasProfileImageUrl: !!user1DataValid.profileImageUrl },
+      user2: { id: user2DataValid.userId, hasProfileImageUrl: !!user2DataValid.profileImageUrl },
+    });
 
     // ✅ NEW: Check gender compatibility AFTER data validation
     const user1Gender = userGenderPreferences.get(user1DataValid.userId) || 'all';
@@ -2353,20 +2608,22 @@ io.on('connection', (socket) => {
       socket.data.userName = userData.userName;
       userSockets.set(userData.userId, socket.id);
 
-      // ✅ NEW: Deliver any offline messages when user comes online
+      // ✅ NEW: Deliver any offline messages when user comes online (respect TTL)
       if (offlineMessages && offlineMessages.has(userData.userId)) {
-        const messages = offlineMessages.get(userData.userId);
-        Logger.info('register_user', `Delivering ${messages.length} offline messages to ${userData.userId}`, {
+        const messages = offlineMessages.get(userData.userId) || [];
+        const now = Date.now();
+        const validMessages = messages.filter(item => now - item.ts <= OFFLINE_MESSAGE_TTL_MS);
+        Logger.info('register_user', `Delivering ${validMessages.length} offline messages to ${userData.userId}`, {
           userId: userData.userId,
-          messageCount: messages.length,
+          messageCount: validMessages.length,
         });
-        
-        // Send all offline messages to the newly connected socket
-        messages.forEach(msg => {
-          socket.emit('direct_message', msg);
+
+        // Send valid offline messages to the newly connected socket
+        validMessages.forEach(item => {
+          try { socket.emit('direct_message', item.payload); } catch (e) {}
         });
-        
-        // Clear offline messages after delivery
+
+        // Remove delivered messages
         offlineMessages.delete(userData.userId);
       }
 
@@ -3380,18 +3637,19 @@ io.on('connection', (socket) => {
         avatarLetter: data.avatarLetter || senderMeta.avatarLetter,
         gender: data.gender || null,
         country: data.country || null,
-        profileImagePath: data.profileImagePath || null,
-        profileImageUrl: data.profileImageUrl || null,
+        profileImagePath: data.profileImagePath ?? senderMeta.profileImagePath ?? null,
+        profileImageUrl: data.profileImageUrl ?? senderMeta.profileImageUrl ?? null,
         timestamp: Date.now(),
       };
 
-      // Update socket metadata with new profile data
+      // Update socket metadata with new profile data, including profileImageUrl
       socketMetadata.set(socket.id, {
         ...senderMeta,
         userName: profileUpdate.userName,
         avatarColor: profileUpdate.avatarColor,
         avatarLetter: profileUpdate.avatarLetter,
         profileImagePath: profileUpdate.profileImagePath || senderMeta.profileImagePath,
+        profileImageUrl: profileUpdate.profileImageUrl || senderMeta.profileImageUrl,
       });
 
       // Broadcast update to all connected clients
@@ -3408,7 +3666,7 @@ io.on('connection', (socket) => {
 
   // ========== DIRECT MESSAGE EVENTS ==========
   // ✅ NEW: Handle direct messages with proper routing and offline storage
-  socket.on('send_direct_message', (data) => {
+  socket.on('send_direct_message', async (data) => {
     try {
       const { recipientId, content, message, text, messageId } = data;
       const senderMeta = socketMetadata.get(socket.id) || {};
@@ -3434,11 +3692,14 @@ io.on('connection', (socket) => {
         : '';
 
       // Build message payload
+      // ✅ NEW: Fetch fresh sender profile from MongoDB for latest profileImageUrl
+      const senderFreshProfile = senderId ? await getFreshUserProfile(senderId) : null;
+      
       const messagePayload = {
         id: finalMessageId,
         messageId: finalMessageId,
         senderId,
-        senderName: senderMeta.userName || 'Unknown',
+        senderName: (senderFreshProfile?.userName || senderMeta.userName || 'Unknown'),
         recipientId,
         message: messageText,
         content: messageText || mediaFallback,
@@ -3447,8 +3708,9 @@ io.on('connection', (socket) => {
         mediaType,
         replyTo: data.replyTo || null,
         profileImagePath: senderMeta.profileImagePath,
+        profileImageUrl: senderFreshProfile?.profileImageUrl || null,
         senderProfileImagePath: senderMeta.profileImagePath,
-        avatarColor: senderMeta.avatarColor || '#128C7E',
+        avatarColor: (senderFreshProfile?.avatarColor || senderMeta.avatarColor || '#128C7E'),
         avatarLetter: senderMeta.avatarLetter || 'U',
         timestamp: new Date().toISOString(),
       };
@@ -3477,7 +3739,7 @@ io.on('connection', (socket) => {
         if (!offlineMessages.has(recipientId)) {
           offlineMessages.set(recipientId, []);
         }
-        offlineMessages.get(recipientId).push(messagePayload);
+        offlineMessages.get(recipientId).push({ payload: messagePayload, ts: Date.now() });
       }
     } catch (err) {
       Logger.error('send_direct_message', 'Error sending direct message', err && err.message);
@@ -3540,6 +3802,22 @@ io.on('connection', (socket) => {
         userGenderPreferences.delete(userData.userId);
       }
       socketMetadata.delete(socket.id);
+      // ✅ FIX: Remove this socket from any groupChatRooms to avoid memory leaks
+      try {
+        for (const [groupName, roomSet] of groupChatRooms.entries()) {
+          if (roomSet && roomSet.has && roomSet.has(socket.id)) {
+            roomSet.delete(socket.id);
+            try { socket.leave(`group_${groupName}`); } catch (e) {}
+            if (roomSet.size === 0) {
+              groupChatRooms.delete(groupName);
+              messageIdCache.delete(groupName);
+              Logger.info('disconnect', 'Cleaned empty group room after disconnect', { groupName });
+            }
+          }
+        }
+      } catch (e) {
+        Logger.warn('disconnect', 'Error cleaning groupChatRooms for socket', { socketId: socket.id, err: e && e.message });
+      }
       socketQueues.delete(socket.id);
       health.updateSocketConnections(io.of('/').sockets.size);
 
@@ -3603,7 +3881,7 @@ io.on('connection', (socket) => {
   });
 
   // User joins a group
-  socket.on('join_group', (data, callback) => {
+  socket.on('join_group', async (data, callback) => {
     try {
       let groupName = data && data.groupName ? String(data.groupName).trim() : null;
       if (!groupName) {
@@ -3676,18 +3954,25 @@ io.on('connection', (socket) => {
       });
 
       // ✅ FIXED: Send complete member list to new joiner (for animations)
+      // ✅ NEW: Enrich members with fresh profiles from MongoDB for latest profileImageUrl
       const allMembers = [];
       for (const memberSocketId of roomSet) {
         const memberMeta = socketMetadata.get(memberSocketId) || {};
-        allMembers.push({
+        
+        // Fetch fresh profile from MongoDB if we have a userId
+        const freshProfile = memberMeta.userId ? await getFreshUserProfile(memberMeta.userId) : null;
+        
+        const memberData = {
           socketId: memberSocketId,
           userId: memberMeta.userId || '',
-          userName: memberMeta.userName || 'Unknown User',
-          avatarColor: memberMeta.avatarColor || '#128C7E',
+          userName: (freshProfile?.userName || memberMeta.userName || 'Unknown User'),
+          avatarColor: (freshProfile?.avatarColor || memberMeta.avatarColor || '#128C7E'),
           avatarLetter: memberMeta.avatarLetter || 'U',
           profileImagePath: memberMeta.profileImagePath || null,
+          profileImageUrl: freshProfile?.profileImageUrl || null,
           senderProfileImagePath: memberMeta.profileImagePath || null,
-        });
+        };
+        allMembers.push(memberData);
       }
 
       const requestedGroupName = baseGroupName;
@@ -3702,6 +3987,9 @@ io.on('connection', (socket) => {
       });
 
       // Notify all users in group (including the new joiner) of new member with full data
+      // ✅ NEW: Fetch fresh profile for the joiner to ensure latest profileImageUrl
+      const joinerFreshProfile = data?.userId ? await getFreshUserProfile(data.userId) : null;
+      
       io.to(`group_${groupName}`).emit('user_joined_group', {
         groupName,
         requestedGroupName,
@@ -3709,10 +3997,11 @@ io.on('connection', (socket) => {
         groupId: data?.groupId || null,
         senderSocketId: socket.id,
         userId: data?.userId,
-        userName: data?.userName || 'Unknown User',
+        userName: (joinerFreshProfile?.userName || data?.userName || 'Unknown User'),
         profileImagePath: data?.profileImagePath || data?.senderProfileImagePath || null,
+        profileImageUrl: joinerFreshProfile?.profileImageUrl || null,
         senderProfileImagePath: data?.senderProfileImagePath || data?.profileImagePath || null,
-        avatarColor: data?.avatarColor || '#128C7E',
+        avatarColor: (joinerFreshProfile?.avatarColor || data?.avatarColor || '#128C7E'),
         avatarLetter: data?.avatarLetter || 'U',
         memberCount,
         capacity: CONFIG.GROUP_ROOM_CAPACITY || 10,
@@ -4012,6 +4301,24 @@ setInterval(() => {
       if (cache.timestamp && now - cache.timestamp > MESSAGE_CACHE_TIMEOUT) {
         messageIdCache.delete(groupName);
       }
+    }
+    // ✅ FIX: Clean stale groupChatRooms entries (remove dead sockets and delete empty rooms)
+    try {
+      for (const [groupName, roomSet] of groupChatRooms.entries()) {
+        for (const memberSocketId of Array.from(roomSet)) {
+          // If socket no longer exists in Socket.IO or no metadata, remove it
+          if (!io.sockets.sockets.has(memberSocketId) || !socketMetadata.has(memberSocketId)) {
+            roomSet.delete(memberSocketId);
+          }
+        }
+        if (roomSet.size === 0) {
+          groupChatRooms.delete(groupName);
+          messageIdCache.delete(groupName);
+          Logger.info('cleanup', 'Removed stale empty group room during cleanup', { groupName });
+        }
+      }
+    } catch (e) {
+      Logger.warn('cleanup', 'Error cleaning stale groupChatRooms', { err: e && e.message });
     }
     
     broadcastStats();
