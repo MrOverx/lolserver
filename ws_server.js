@@ -464,6 +464,16 @@ const BlockedUser = mongoose.model('BlockedUser', blockedUserSchema);
 const Report = mongoose.model('Report', reportSchema);
 const Friend = mongoose.model('Friend', friendSchema);
 
+// ✅ Helper: Normalize any incoming ID-like value to a trimmed string
+function normalizeId(id) {
+  if (id === undefined || id === null) return '';
+  try {
+    return String(id).trim();
+  } catch (e) {
+    return '';
+  }
+}
+
 // Simple lookup endpoint to help debug join-by-invite behavior from clients
 app.get('/room/by-invite/:code', (req, res) => {
   try {
@@ -1274,8 +1284,9 @@ app.post('/friends/add', async (req, res) => {
   }
 
   try {
-    const { friendId } = req.body;
-    const userId = req.body.userId || req.headers['x-user-id'];
+    const { friendId: rawFriendId } = req.body;
+    const userId = normalizeId(req.body.userId || req.headers['x-user-id']);
+    const friendId = normalizeId(rawFriendId);
 
     if (!userId || !friendId) {
       return sendError(res, 400, 'userId and friendId are required');
@@ -1294,6 +1305,16 @@ app.post('/friends/add', async (req, res) => {
     
     if (!friendUser) {
       return sendError(res, 404, 'User not found');
+    }
+
+    let senderUser = userCache.get(userId);
+    if (!senderUser) {
+      senderUser = await User.findOne({ userId }).lean().exec();
+      if (senderUser) userCache.set(userId, senderUser);
+    }
+
+    if (!senderUser || senderUser.isGuest) {
+      return sendError(res, 403, 'User are guest, you cannot send a request.');
     }
 
     // Check if already friends or pending request
@@ -1320,7 +1341,6 @@ app.post('/friends/add', async (req, res) => {
     Logger.info('friends/add', 'Friend request sent', { userId, friendId });
 
     // ✅ OPTIMIZED: Get sender user for notification from cache
-    let senderUser = userCache.get(userId);
     if (!senderUser) {
       senderUser = await User.findOne({ userId: userId }).lean().exec();
       if (senderUser) userCache.set(userId, senderUser);
@@ -1360,7 +1380,7 @@ app.post('/friends/request/:requestId/accept', async (req, res) => {
 
   try {
     const { requestId } = req.params;
-    const userId = req.body.userId || req.headers['x-user-id'];
+    const userId = normalizeId(req.body.userId || req.headers['x-user-id']);
 
     if (!userId || !requestId) {
       return sendError(res, 400, 'userId and requestId are required');
@@ -1373,7 +1393,7 @@ app.post('/friends/request/:requestId/accept', async (req, res) => {
     }
 
     // Verify this user is the recipient
-    if (friendRequest.friendId !== userId) {
+    if (normalizeId(friendRequest.friendId) !== userId) {
       return sendError(res, 403, 'Not authorized to accept this request');
     }
 
@@ -1422,7 +1442,7 @@ app.post('/friends/request/:requestId/deny', async (req, res) => {
 
   try {
     const { requestId } = req.params;
-    const userId = req.body.userId || req.headers['x-user-id'];
+    const userId = normalizeId(req.body.userId || req.headers['x-user-id']);
 
     if (!userId || !requestId) {
       return sendError(res, 400, 'userId and requestId are required');
@@ -1435,7 +1455,7 @@ app.post('/friends/request/:requestId/deny', async (req, res) => {
     }
 
     // Verify this user is the recipient
-    if (friendRequest.friendId !== userId) {
+    if (normalizeId(friendRequest.friendId) !== userId) {
       return sendError(res, 403, 'Not authorized to deny this request');
     }
 
@@ -1459,8 +1479,9 @@ app.post('/friends/remove', async (req, res) => {
   }
 
   try {
-    const { friendId } = req.body;
-    const userId = req.body.userId || req.headers['x-user-id'];
+    const { friendId: rawFriendId } = req.body;
+    const userId = normalizeId(req.body.userId || req.headers['x-user-id']);
+    const friendId = normalizeId(rawFriendId);
 
     if (!userId || !friendId) {
       return sendError(res, 400, 'userId and friendId are required');
@@ -1501,7 +1522,7 @@ app.get('/friends/list', async (req, res) => {
   }
 
   try {
-    const userId = req.query.userId || req.headers['x-user-id'];
+    const userId = normalizeId(req.query.userId || req.headers['x-user-id']);
 
     if (!userId) {
       return sendError(res, 400, 'userId is required');
@@ -1517,23 +1538,28 @@ app.get('/friends/list', async (req, res) => {
     }).lean();
 
     // Get friend user details with all profile fields
-    const friendIds = friends.map((f) => (f.userId === userId ? f.friendId : f.userId));
+    const friendIds = friends.map((f) => normalizeId(f.userId === userId ? f.friendId : f.userId));
     const friendUsers = await User.find(
       { userId: { $in: friendIds }, isActive: true },
       'userId userName avatarColor avatarLetter profileImageUrl gender country'
     ).lean();
 
     // ✅ Enhanced: Include online status by checking if user has active socket
-    const friendList = friendUsers.map((u) => ({
-      userId: u.userId,
-      userName: u.userName,
-      avatarColor: u.avatarColor,
-      avatarLetter: u.avatarLetter || u.userName.charAt(0).toUpperCase(),
-      profileImageUrl: u.profileImageUrl,
-      gender: u.gender || 'other',
-      country: u.country || null,
-      isOnline: userSockets.has(u.userId), // ✅ Check if user is currently connected
-    }));
+    const friendList = friendUsers.map((u) => {
+      const normalizedId = normalizeId(u.userId);
+      return {
+        userId: normalizedId,
+        id: normalizedId,
+        friendId: normalizedId,
+        userName: u.userName,
+        avatarColor: u.avatarColor,
+        avatarLetter: u.avatarLetter || (u.userName ? u.userName.charAt(0).toUpperCase() : 'U'),
+        profileImageUrl: u.profileImageUrl,
+        gender: u.gender || 'other',
+        country: u.country || null,
+        isOnline: userSockets.has(normalizedId), // ✅ Check if user is currently connected
+      };
+    });
 
     return res.status(200).json({
       success: true,
@@ -1554,7 +1580,7 @@ app.get('/friends/requests/incoming', async (req, res) => {
   }
 
   try {
-    const userId = req.query.userId || req.headers['x-user-id'];
+    const userId = normalizeId(req.query.userId || req.headers['x-user-id']);
 
     if (!userId) {
       return sendError(res, 400, 'userId is required');
@@ -1574,18 +1600,21 @@ app.get('/friends/requests/incoming', async (req, res) => {
     ).lean();
 
     // Map requests to include sender details
-    const requestsList = incomingRequests.map((req) => {
-      const sender = senderUsers.find((u) => u.userId === req.userId);
+    const requestsList = incomingRequests.map((request) => {
+      const normalizedSenderId = normalizeId(request.userId);
+      const sender = senderUsers.find((u) => normalizeId(u.userId) === normalizedSenderId);
       return {
-        requestId: req._id.toString(),
-        userId: req.userId,
+        requestId: request._id.toString(),
+        userId: normalizedSenderId,
+        id: normalizedSenderId,
+        friendId: normalizedSenderId,
         userName: sender?.userName || 'Unknown',
         avatarColor: sender?.avatarColor,
         avatarLetter: sender?.avatarLetter || (sender?.userName || 'U').charAt(0).toUpperCase(),
         profileImageUrl: sender?.profileImageUrl,
         gender: sender?.gender || 'other',
         country: sender?.country || null,
-        createdAt: req.createdAt,
+        createdAt: request.createdAt,
       };
     });
 
@@ -1608,7 +1637,7 @@ app.get('/friends/requests/outgoing', async (req, res) => {
   }
 
   try {
-    const userId = req.query.userId || req.headers['x-user-id'];
+    const userId = normalizeId(req.query.userId || req.headers['x-user-id']);
 
     if (!userId) {
       return sendError(res, 400, 'userId is required');
@@ -1628,18 +1657,21 @@ app.get('/friends/requests/outgoing', async (req, res) => {
     ).lean();
 
     // Map requests to include recipient details
-    const requestsList = outgoingRequests.map((req) => {
-      const recipient = recipientUsers.find((u) => u.userId === req.friendId);
+    const requestsList = outgoingRequests.map((request) => {
+      const normalizedRecipientId = normalizeId(request.friendId);
+      const recipient = recipientUsers.find((u) => normalizeId(u.userId) === normalizedRecipientId);
       return {
-        requestId: req._id.toString(),
-        userId: req.friendId,
+        requestId: request._id.toString(),
+        userId: normalizedRecipientId,
+        id: normalizedRecipientId,
+        friendId: normalizedRecipientId,
         userName: recipient?.userName || 'Unknown',
         avatarColor: recipient?.avatarColor,
         avatarLetter: recipient?.avatarLetter || (recipient?.userName || 'U').charAt(0).toUpperCase(),
         profileImageUrl: recipient?.profileImageUrl,
         gender: recipient?.gender || 'other',
         country: recipient?.country || null,
-        createdAt: req.createdAt,
+        createdAt: request.createdAt,
       };
     });
 
@@ -2521,10 +2553,11 @@ io.on('connection', (socket) => {
   const handshakeUserId = socket.handshake?.query?.userId;
   if (handshakeUserId) {
     socket.data = socket.data || {};
-    socket.data.userId = handshakeUserId;
-    userSockets.set(handshakeUserId, socket.id);
+    const hId = normalizeId(handshakeUserId);
+    socket.data.userId = hId;
+    userSockets.set(hId, socket.id);
     socketMetadata.set(socket.id, {
-      userId: handshakeUserId,
+      userId: hId,
       joinedAt: Date.now(),
     });
   }
@@ -2592,8 +2625,9 @@ io.on('connection', (socket) => {
       }
 
       // Store MINIMAL socket metadata (only what's needed for real-time features)
+      const normalizedUserId = normalizeId(userData.userId);
       socketMetadata.set(socket.id, {
-        userId: userData.userId,
+        userId: normalizedUserId,
         userName: userData.userName,
         avatarColor: userData.avatarColor || '#128C7E',
         avatarLetter: userData.avatarLetter || userData.userName[0].toUpperCase(),
@@ -2604,17 +2638,17 @@ io.on('connection', (socket) => {
       });
 
       socket.data = socket.data || {};
-      socket.data.userId = userData.userId;
+      socket.data.userId = normalizedUserId;
       socket.data.userName = userData.userName;
-      userSockets.set(userData.userId, socket.id);
+      userSockets.set(normalizedUserId, socket.id);
 
       // ✅ NEW: Deliver any offline messages when user comes online (respect TTL)
-      if (offlineMessages && offlineMessages.has(userData.userId)) {
-        const messages = offlineMessages.get(userData.userId) || [];
+      if (offlineMessages && offlineMessages.has(normalizedUserId)) {
+        const messages = offlineMessages.get(normalizedUserId) || [];
         const now = Date.now();
         const validMessages = messages.filter(item => now - item.ts <= OFFLINE_MESSAGE_TTL_MS);
-        Logger.info('register_user', `Delivering ${validMessages.length} offline messages to ${userData.userId}`, {
-          userId: userData.userId,
+        Logger.info('register_user', `Delivering ${validMessages.length} offline messages to ${normalizedUserId}`, {
+          userId: normalizedUserId,
           messageCount: validMessages.length,
         });
 
@@ -2624,7 +2658,7 @@ io.on('connection', (socket) => {
         });
 
         // Remove delivered messages
-        offlineMessages.delete(userData.userId);
+        offlineMessages.delete(normalizedUserId);
       }
 
       // Simple logging - no sensitive data stored
@@ -2709,17 +2743,18 @@ io.on('connection', (socket) => {
         if (userPayload) {
           const validation = validateUserData(userPayload);
           if (validation.valid) {
+            const normalizedUserId = normalizeId(userPayload.userId);
             socketMetadata.set(socket.id, {
-              userId: userPayload.userId,
+              userId: normalizedUserId,
               userName: userPayload.userName,
               avatarColor: userPayload.avatarColor || '#128C7E',
               avatarLetter: userPayload.avatarLetter || (userPayload.userName ? userPayload.userName[0].toUpperCase() : 'U'),
               profileImagePath: userPayload.profileImagePath || null,
               joinedAt: Date.now(),
             });
-            userSockets.set(userPayload.userId, socket.id);
+            userSockets.set(normalizedUserId, socket.id);
             meta = socketMetadata.get(socket.id) || {};
-            Logger.info('create_room', 'Auto-registered user from create_room payload', { socketId: socket.id, userId: userPayload.userId });
+            Logger.info('create_room', 'Auto-registered user from create_room payload', { socketId: socket.id, userId: normalizedUserId });
             broadcastStats();
           } else {
             if (callback) callback({ success: false, error: validation.error });
@@ -2815,15 +2850,16 @@ io.on('connection', (socket) => {
 
           const validation = validateUserData(userPayload);
           if (validation.valid) {
+            const normalizedUserId = normalizeId(userPayload.userId);
             socketMetadata.set(socket.id, {
-              userId: userPayload.userId,
+              userId: normalizedUserId,
               userName: userPayload.userName,
               avatarColor: userPayload.avatarColor || '#128C7E',
               avatarLetter: userPayload.avatarLetter || (userPayload.userName ? userPayload.userName[0].toUpperCase() : 'U'),
               profileImagePath: userPayload.profileImagePath || null,
               joinedAt: Date.now(),
             });
-            userSockets.set(userPayload.userId, socket.id);
+            userSockets.set(normalizedUserId, socket.id);
             meta = socketMetadata.get(socket.id) || {};
             userId = meta.userId;
             Logger.info('join_room', 'Auto-registered user from join payload', { socketId: socket.id, userId });
@@ -3668,9 +3704,12 @@ io.on('connection', (socket) => {
   // ✅ NEW: Handle direct messages with proper routing and offline storage
   socket.on('send_direct_message', async (data) => {
     try {
-      const { recipientId, content, message, text, messageId } = data;
+      const { recipientId: rawRecipientId, content, message, text, messageId } = data;
       const senderMeta = socketMetadata.get(socket.id) || {};
-      const senderId = senderMeta.userId;
+      const senderId = normalizeId(senderMeta.userId);
+      const recipientId = normalizeId(rawRecipientId || data.to || data.recipient);
+      // keep backward compat: if recipientId empty, try a few keys
+      // (already attempted above)
       const messageText = content || message || text || '';
       const mediaUrl = data.mediaUrl || data.gifUrl || data.media || data.image || data.media_url || null;
       const mediaType = data.mediaType || data.type || data.gifType || data.media_type || null;
@@ -3698,9 +3737,9 @@ io.on('connection', (socket) => {
       const messagePayload = {
         id: finalMessageId,
         messageId: finalMessageId,
-        senderId,
+        senderId: senderId,
         senderName: (senderFreshProfile?.userName || senderMeta.userName || 'Unknown'),
-        recipientId,
+        recipientId: recipientId,
         message: messageText,
         content: messageText || mediaFallback,
         text: messageText || mediaFallback,
@@ -3721,25 +3760,26 @@ io.on('connection', (socket) => {
         // ✅ IMPORTANT: Recipient is online - send message immediately
         io.to(recipientSocketId).emit('direct_message', messagePayload);
         Logger.info('send_direct_message', 'Message sent to online recipient', {
-          senderId,
-          recipientId,
+          senderId: senderId,
+          recipientId: recipientId,
           recipientSocketId,
         });
       } else {
         // ✅ NEW: Recipient is offline - store message for later delivery
         Logger.info('send_direct_message', 'Recipient offline, storing message for later', {
-          senderId,
-          recipientId,
+          senderId: senderId,
+          recipientId: recipientId,
         });
         
         // Store in offlineMessages map for delivery when recipient comes online
         if (!offlineMessages) {
           offlineMessages = new Map();
         }
-        if (!offlineMessages.has(recipientId)) {
-          offlineMessages.set(recipientId, []);
+        const key = recipientId;
+        if (!offlineMessages.has(key)) {
+          offlineMessages.set(key, []);
         }
-        offlineMessages.get(recipientId).push({ payload: messagePayload, ts: Date.now() });
+        offlineMessages.get(key).push({ payload: messagePayload, ts: Date.now() });
       }
     } catch (err) {
       Logger.error('send_direct_message', 'Error sending direct message', err && err.message);
@@ -3749,20 +3789,21 @@ io.on('connection', (socket) => {
   // ✅ NEW: Handle message seen/read receipt - Notify sender that their message was read
   socket.on('message_seen', (data) => {
     try {
-      const { senderId, recipientId, senderName, timestamp } = data;
+      const senderId = normalizeId(data.senderId);
+      const recipientId = normalizeId(data.recipientId);
       const senderSocketId = userSockets.get(senderId);
 
       if (senderSocketId) {
         // ✅ Send read receipt confirmation back to sender
         io.to(senderSocketId).emit('message_read_receipt', {
           senderId: recipientId,
-          senderName: senderName || 'User',
-          timestamp: timestamp || new Date().toISOString(),
+          senderName: data.senderName || 'User',
+          timestamp: data.timestamp || new Date().toISOString(),
         });
         Logger.info('message_seen', 'Read receipt sent to sender', {
           senderId,
           recipientId,
-          senderName,
+          senderName: data.senderName,
         });
       } else {
         Logger.info('message_seen', 'Sender offline, skipping read receipt', {
