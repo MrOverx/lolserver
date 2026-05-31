@@ -144,6 +144,13 @@ const corsOptions = {
       return callback(null, true);
     }
     
+    // Log blocked origin for debugging purposes
+    try {
+      Logger.warn('cors', `Blocked origin: ${origin || '<no-origin>'}`);
+    } catch (e) {
+      console.warn('cors: Blocked origin', origin);
+    }
+
     return callback(new Error('CORS policy: Origin not allowed'));
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -191,7 +198,7 @@ if (!MONGODB_URI) {
   process.exit(1);
 }
 
-const dbNameMatch = MONGODB_URI.match(/^[^\/]+\/([^?]+)(\?|$)/);
+const dbNameMatch = MONGODB_URI.match(/^[^?]*\/([^?\/]+)(\?|$)/);
 const configuredDb = dbNameMatch ? dbNameMatch[1] : null;
 if (!configuredDb) {
   console.error('❌ MongoDB URI does not include a database name. This backend requires a target database.');
@@ -255,6 +262,23 @@ const CONFIG = {
 
 const isDatabaseConnected = () => mongoose.connection.readyState === 1;
 let serverStarted = false;
+let isGracefulShutdown = false;
+
+process.on('unhandledRejection', (reason, promise) => {
+  Logger.error('process', 'Unhandled promise rejection', {
+    reason: reason?.toString?.() || reason,
+    promise: promise?.toString?.() || 'unknown',
+  });
+});
+
+process.on('uncaughtException', (err) => {
+  Logger.error('process', 'Uncaught exception', err?.message || err);
+  console.error(err);
+  if (!isGracefulShutdown) {
+    isGracefulShutdown = true;
+    process.exit(1);
+  }
+});
 
 function startServer() {
   if (serverStarted) return;
@@ -337,8 +361,8 @@ const io = socketIO(server, {
   allowEIO3: true,
   
   // ✅ OPTIMIZED: Connection timing
-  pingInterval: 10000,  // Check connection every 10s (was 15s)
-  pingTimeout: 4000,    // Wait 4s for pong (was 45s) - faster detection
+  pingInterval: 25000,  // Check connection every 25s
+  pingTimeout: 10000,    // Wait 10s for pong before disconnecting
   
   // ✅ CRITICAL FIX: Payload settings
   // Increased from 100KB to 5MB to allow profile images in register_user payload
@@ -348,7 +372,7 @@ const io = socketIO(server, {
   // ✅ OPTIMIZED: Connection settings
   upgrade: true,           // Allow upgrade from polling to WebSocket
   rememberUpgrade: true,   // Remember which transport works
-  connectTimeout: 5000,    // 5s to establish connection
+  connectTimeout: 10000,   // 10s to establish connection
 });
 
 // ✅ NEW: Global Socket.IO error handler for connection issues
