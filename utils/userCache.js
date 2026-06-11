@@ -7,10 +7,11 @@
 const { Logger } = require('./logger');
 
 class UserCache {
-  constructor(ttlMs = 5 * 60 * 1000) {
-    // 5 minute default TTL
+  constructor(ttlMs = 5 * 60 * 1000, maxEntries = 2000) {
+    // 5 minute default TTL with a bounded memory footprint
     this.cache = new Map();
     this.ttlMs = ttlMs;
+    this.maxEntries = maxEntries;
     this.hitCount = 0;
     this.missCount = 0;
   }
@@ -53,6 +54,13 @@ class UserCache {
       expiresAt: Date.now() + this.ttlMs,
       createdAt: Date.now(),
     });
+
+    if (this.cache.size > this.maxEntries) {
+      const oldestEntryKey = this.cache.keys().next().value;
+      if (oldestEntryKey !== undefined) {
+        this.cache.delete(oldestEntryKey);
+      }
+    }
   }
 
   /**
@@ -114,6 +122,7 @@ class UserCache {
       total: total,
       hitRate: `${hitRate}%`,
       ttlMs: this.ttlMs,
+      maxEntries: this.maxEntries,
     };
   }
 

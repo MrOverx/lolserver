@@ -11,7 +11,7 @@
  * @returns {object} Formatted error response
  */
 function sendError(res, statusCode, message, errorCode = null) {
-  const response = { success: false, error: message };
+  const response = { success: false, message, error: message };
   if (errorCode) {
     if (typeof errorCode === 'string') {
       response.code = errorCode;

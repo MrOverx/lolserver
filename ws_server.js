@@ -112,6 +112,7 @@ Logger.setLevel(process.env.NODE_ENV === 'development' ? Logger.LOG_LEVELS.DEBUG
 const app = express();
 const server = http.createServer(app);
 
+app.set('trust proxy', true);
 app.disable('x-powered-by');
 server.keepAliveTimeout = 65000;
 server.headersTimeout = 70000;
@@ -137,14 +138,43 @@ if (allowedOriginsSet.size === 0) {
   allowedOriginsSet.delete('*');
 }
 
-const isLocalhostOrigin = (origin) => /^http:\/\/localhost(:\d+)?$/.test(origin);
+const isLocalhostOrigin = (origin) => /^https?:\/\/localhost(:\d+)?$/.test(origin);
+const normalizeOrigin = (origin) => {
+  if (!origin) return null;
+  try {
+    return new URL(origin).origin;
+  } catch (error) {
+    return origin;
+  }
+};
+
+const isAllowedOrigin = (origin) => {
+  if (!origin) return true;
+
+  const normalizedOrigin = normalizeOrigin(origin);
+  if (!normalizedOrigin) return true;
+
+  if (allowedOriginsSet.has(normalizedOrigin) || allowedOriginsSet.has('*')) return true;
+  if (process.env.NODE_ENV === 'development' && isLocalhostOrigin(normalizedOrigin)) return true;
+
+  if (process.env.NODE_ENV !== 'development' && (allowedOriginsSet.size === 0 || process.env.CORS_ALLOW_ALL === 'true')) {
+    return true;
+  }
+
+  try {
+    const hostname = new URL(normalizedOrigin).hostname;
+    if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname.endsWith('.localhost')) return true;
+    if (hostname.endsWith('.amazonaws.com') || hostname.endsWith('.elasticbeanstalk.com') || hostname.endsWith('.app.github.dev')) return true;
+  } catch (error) {
+    // Ignore malformed origin values and fall back to rejection below.
+  }
+
+  return false;
+};
+
 const corsOptions = {
   origin: (origin, callback) => {
-    if (!origin) return callback(null, true);
-    if (allowedOriginsSet.has(origin)) return callback(null, true);
-    if (process.env.NODE_ENV === 'development' && isLocalhostOrigin(origin)) {
-      return callback(null, true);
-    }
+    if (isAllowedOrigin(origin)) return callback(null, true);
 
     try {
       Logger.warn('cors', `Blocked origin: ${origin}`);
@@ -372,27 +402,31 @@ mongoose.connection.on('error', (err) => {
 });
 
 
-// ✅ OPTIMIZED: Socket.IO Configuration for maximum performance
+// ✅ OPTIMIZED: Socket.IO Configuration for deployment compatibility
 const io = socketIO(server, {
   cors: {
-    origin: allowedOriginsSet.has('*') ? '*' : Array.from(allowedOriginsSet),
-    methods: ['GET', 'POST'],
+    origin: (origin, callback) => {
+      if (isAllowedOrigin(origin)) return callback(null, true);
+      return callback(new Error('CORS policy: Origin not allowed'));
+    },
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    credentials: true,
   },
-  
-  // ✅ OPTIMIZED: Transport options - prefer WebSocket only to avoid polling/backpressure
-  transports: ['websocket'],
+
+  // ✅ OPTIMIZED: Transport options - allow both websocket and polling for AWS/load balancer compatibility
+  transports: ['websocket', 'polling'],
   // Allow older engine.io v3 clients (mobile clients may use older engines)
   allowEIO3: true,
-  
+
   // ✅ OPTIMIZED: Connection timing
   pingInterval: 25000,  // Check connection every 25s
   pingTimeout: 10000,    // Wait 10s for pong before disconnecting
-  
+
   // ✅ CRITICAL FIX: Payload settings
   // Increased from 100KB to 5MB to allow profile images in register_user payload
   // Server-side validation will discard large images before re-emitting
   maxHttpBufferSize: 5 * 1024 * 1024,  // 5MB max payload (allows initial profile image upload)
-  
+
   // ✅ OPTIMIZED: Connection settings
   upgrade: true,           // Allow upgrade from polling to WebSocket
   rememberUpgrade: true,   // Remember which transport works
@@ -2268,8 +2302,8 @@ async function verifyDeleteCredentials(credentials = {}) {
   }
 
   if (!user.passwordHash) {
-    const error = new Error('This account was created with Google sign-in and does not have a password. Please use Google sign-in or create a password first.');
-    error.code = 'PASSWORD_NOT_SET';
+    const error = new Error('Invalid email or password');
+    error.code = 'INVALID_CREDENTIALS';
     error.statusCode = 401;
     throw error;
   }
