@@ -7,6 +7,8 @@ const smtpSecure = String(process.env.SMTP_SECURE || 'true').toLowerCase() !== '
 const smtpUser = process.env.SMTP_USER;
 const smtpPass = process.env.SMTP_PASS;
 const smtpFrom = process.env.SMTP_FROM || smtpUser;
+const appName = process.env.APP_NAME || 'SLYXY';
+const smtpFromName = process.env.SMTP_FROM_NAME || appName;
 
 function isEmailConfigured() {
   return !!smtpUser && !!smtpPass;
@@ -28,12 +30,13 @@ async function sendOtpEmail(to, otp) {
   }
 
   const expiresSeconds = Number(process.env.OTP_EXPIRE_SECONDS || 300);
+  const fromAddress = smtpFromName && smtpFrom ? `${smtpFromName} <${smtpFrom}>` : smtpFrom;
   const mailOptions = {
-    from: smtpFrom,
+    from: fromAddress,
     to,
-    subject: process.env.OTP_EMAIL_SUBJECT || 'Your OmegleLOL verification code',
-    text: `Your OmegleLOL verification code is ${otp}. It expires in ${expiresSeconds} seconds.\n\nIf you did not request this, please ignore this email.`,
-    html: `<p>Your OmegleLOL verification code is <strong>${otp}</strong>.</p><p>This code expires in ${expiresSeconds} seconds.</p>`,
+    subject: process.env.OTP_EMAIL_SUBJECT || `Your ${appName} verification code`,
+    text: `Your ${appName} verification code is ${otp}. It expires in ${expiresSeconds} seconds.\n\nIf you did not request this, please ignore this email.`,
+    html: `<p>Your ${appName} verification code is <strong>${otp}</strong>.</p><p>This code expires in ${expiresSeconds} seconds.</p>`,
   };
 
   const info = await transporter.sendMail(mailOptions);

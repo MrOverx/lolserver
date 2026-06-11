@@ -112,41 +112,42 @@ Logger.setLevel(process.env.NODE_ENV === 'development' ? Logger.LOG_LEVELS.DEBUG
 const app = express();
 const server = http.createServer(app);
 
-let ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
+app.disable('x-powered-by');
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 70000;
+server.timeout = 120000;
+
+const allowedOriginsRaw = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(origin => origin.trim()).filter(Boolean)
   : [];
 
 // Backwards-compatible developer convenience: allow wildcard in development only.
-if (ALLOWED_ORIGINS.length === 0) {
-  // If no origins specified, default to a strict empty list in production
+const defaultDevOrigins = ['http://localhost:3000', 'http://localhost:8080'];
+let allowedOriginsSet = new Set(allowedOriginsRaw);
+
+if (allowedOriginsSet.size === 0) {
   if (process.env.NODE_ENV === 'development') {
-    ALLOWED_ORIGINS = ['http://localhost:3000', 'http://localhost:8080'];
-    Logger.info('cors', 'No ALLOWED_ORIGINS set; using development defaults', { ALLOWED_ORIGINS });
+    allowedOriginsSet = new Set(defaultDevOrigins);
+    Logger.info('cors', 'No ALLOWED_ORIGINS set; using development defaults', { allowedOrigins: defaultDevOrigins });
   } else {
     Logger.warn('cors', 'No ALLOWED_ORIGINS configured; CORS will be restricted. Set ALLOWED_ORIGINS in env to allow origins.');
   }
-} else if (ALLOWED_ORIGINS.includes('*') && process.env.NODE_ENV !== 'development') {
-  // Prevent wildcard in non-dev to avoid accidental open CORS in production
+} else if (allowedOriginsSet.has('*') && process.env.NODE_ENV !== 'development') {
   Logger.warn('cors', 'Wildcard origin (*) detected in ALLOWED_ORIGINS in non-development environment. Removing wildcard for safety.');
-  ALLOWED_ORIGINS = ALLOWED_ORIGINS.filter(o => o !== '*');
+  allowedOriginsSet.delete('*');
 }
 
+const isLocalhostOrigin = (origin) => /^http:\/\/localhost(:\d+)?$/.test(origin);
 const corsOptions = {
   origin: (origin, callback) => {
-    // Allow same-origin or no origin (e.g., curl, server-to-server)
     if (!origin) return callback(null, true);
-    
-    // Check string origins
-    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
-    
-    // In development, allow any localhost:* origin (for Flutter dev server, etc.)
-    if (process.env.NODE_ENV === 'development' && /^http:\/\/localhost(:\d+)?$/.test(origin)) {
+    if (allowedOriginsSet.has(origin)) return callback(null, true);
+    if (process.env.NODE_ENV === 'development' && isLocalhostOrigin(origin)) {
       return callback(null, true);
     }
-    
-    // Log blocked origin for debugging purposes
+
     try {
-      Logger.warn('cors', `Blocked origin: ${origin || '<no-origin>'}`);
+      Logger.warn('cors', `Blocked origin: ${origin}`);
     } catch (e) {
       console.warn('cors: Blocked origin', origin);
     }
@@ -221,6 +222,9 @@ const MONGODB_CONFIG = {
     socketTimeoutMS: 45000,
     serverSelectionTimeoutMS: 5000,
     connectTimeoutMS: 10000,
+    maxIdleTimeMS: 300000,
+    bufferCommands: false,
+    autoIndex: false,
     retryWrites: true,
     retryReads: true,
     writeConcern: { w: 'majority' },
@@ -289,6 +293,26 @@ function startServer() {
       advertisedIP: CONFIG.SERVER_IP,
       port: CONFIG.PORT,
     });
+
+    // ✅ NEW: Start stale voice space cleanup timer
+    const SPACE_IDLE_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+    setInterval(() => {
+      const now = Date.now();
+      let cleanedCount = 0;
+      for (const [spaceId, space] of activeVoiceSpaces.entries()) {
+        if (space.participants.length === 0 && (now - space.createdAt > SPACE_IDLE_TIMEOUT)) {
+          activeVoiceSpaces.delete(spaceId);
+          for (const participant of space.participants) {
+            userToSpaceMap.delete(participant.userId);
+          }
+          cleanedCount++;
+        }
+      }
+      if (cleanedCount > 0) {
+        Logger.info('cleanup', `Removed ${cleanedCount} stale voice space(s)`, {});
+        broadcastActiveSpaces();
+      }
+    }, SPACE_IDLE_TIMEOUT);
   });
 }
 
@@ -351,7 +375,7 @@ mongoose.connection.on('error', (err) => {
 // ✅ OPTIMIZED: Socket.IO Configuration for maximum performance
 const io = socketIO(server, {
   cors: {
-    origin: ALLOWED_ORIGINS.includes('*') ? '*' : ALLOWED_ORIGINS,
+    origin: allowedOriginsSet.has('*') ? '*' : Array.from(allowedOriginsSet),
     methods: ['GET', 'POST'],
   },
   
@@ -384,11 +408,6 @@ io.engine.on('connection_error', (err) => {
   });
 });
 
-// ✅ NEW: Log all socket disconnection reasons
-io.on('disconnect', (reason) => {
-  Logger.warn('io_disconnect', `🔴 Global disconnect: ${reason}`);
-});
-
 // ========== MONGODB SCHEMAS ==========
 
 // User Schema
@@ -402,6 +421,9 @@ const userSchema = new mongoose.Schema({
   // Profile Information
   gender: { type: String, enum: ['male', 'female', 'other'], default: 'other' },
   country: { type: String, default: null, index: true },
+  status: { type: String, default: null },
+  bio: { type: String, default: null, maxlength: 500 },
+  interests: { type: [String], default: [] },
   birthDate: { type: Date, default: null },
   profileComplete: { type: Boolean, default: false, index: true }, // ✅ Track if user completed profile setup
   
@@ -488,6 +510,174 @@ const BlockedUser = mongoose.model('BlockedUser', blockedUserSchema);
 const Report = mongoose.model('Report', reportSchema);
 const Friend = mongoose.model('Friend', friendSchema);
 
+// ✅ IN-MEMORY VOICE SPACES (Temporary, Volatile - Not Persistent)
+// Format: spaceId -> { spaceId, spaceName, description, hostId, hostName, hostAvatar, hostAvatarColor, hostProfileImageUrl, isPrivate, speakerLimit, participants: [], createdAt, status }
+const activeVoiceSpaces = new Map(); // spaceId -> space object
+
+// Track user's current space for auto-cleanup on disconnect
+const userToSpaceMap = new Map(); // userId -> spaceId
+
+// Delay cleanup for temporary disconnects so quick reconnects do not destroy voice spaces
+const pendingVoiceSpaceDisconnects = new Map(); // userId -> timeoutId
+const VOICE_SPACE_DISCONNECT_GRACE_MS = 10000;
+
+function getSpaceStatus(space) {
+  let currentListeners = 0;
+  let currentSpeakers = 0;
+  for (const participant of space.participants || []) {
+    if (participant.role === 'Speaker') {
+      currentSpeakers += 1;
+    } else if (participant.role === 'Listener') {
+      currentListeners += 1;
+    }
+  }
+  return {
+    currentListeners,
+    currentSpeakers,
+    participantCount: (space.participants || []).length,
+  };
+}
+
+function serializeSpace(space) {
+  const status = getSpaceStatus(space);
+  return {
+    ...space,
+    ...status,
+    participants: undefined,
+  };
+}
+
+function getSortedActiveSpaces() {
+  return Array.from(activeVoiceSpaces.values())
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .map(serializeSpace);
+}
+
+function broadcastActiveSpaces() {
+  io.emit('active_spaces_updated', { spaces: getSortedActiveSpaces() });
+}
+
+function emitSpaceUpdated(space) {
+  const payload = {
+    spaceId: space.spaceId,
+    participants: space.participants,
+    ...getSpaceStatus(space),
+  };
+  io.to(`space:${space.spaceId}`).emit('space_updated', payload);
+  try {
+    const room = io.sockets.adapter.rooms.get(`space:${space.spaceId}`);
+    const socketsInRoom = room ? room.size : 0;
+    Logger.debug('emitSpaceUpdated', `Updated space:${space.spaceId} (participants=${payload.participantCount}, socketsInRoom=${socketsInRoom})`);
+  } catch (err) {
+    Logger.warn('emitSpaceUpdated', 'Could not inspect room membership', err && err.message);
+  }
+}
+
+async function resolveUserProfileMetadata(userId, userMeta = {}, fallbackName = 'Guest', defaultColor = '#128C7E', defaultInitial = 'U') {
+  const freshProfile = await getFreshUserProfile(userId).catch(() => null);
+  const userName = freshProfile?.userName || userMeta.userName || fallbackName;
+  const avatarLetter = freshProfile?.userName ? freshProfile.userName.charAt(0).toUpperCase() : (userMeta.avatarLetter || defaultInitial);
+  const avatarColor = freshProfile?.avatarColor || userMeta.avatarColor || defaultColor;
+  const profileImageUrl = freshProfile?.profileImageUrl || userMeta.profileImagePath || null;
+  return { userName, avatarLetter, avatarColor, profileImageUrl };
+}
+
+function buildParticipant(userId, meta, role) {
+  return {
+    userId,
+    userName: meta.userName,
+    role,
+    avatarColor: meta.avatarColor,
+    avatarLetter: meta.avatarLetter,
+    profileImageUrl: meta.profileImageUrl,
+    joinedAt: Date.now(),
+  };
+}
+
+function scheduleVoiceSpaceDisconnectCleanup(userId, spaceId, reason = 'participant_disconnected', socketId = null) {
+  if (!userId || !spaceId) return;
+
+  if (pendingVoiceSpaceDisconnects.has(userId)) {
+    clearTimeout(pendingVoiceSpaceDisconnects.get(userId));
+    pendingVoiceSpaceDisconnects.delete(userId);
+  }
+
+  const timeoutId = setTimeout(() => {
+    pendingVoiceSpaceDisconnects.delete(userId);
+    const space = activeVoiceSpaces.get(spaceId);
+    if (!space) {
+      userToSpaceMap.delete(userId);
+      return;
+    }
+
+    const participantIdx = space.participants.findIndex((p) => String(p.userId) === String(userId));
+    if (participantIdx === -1) {
+      userToSpaceMap.delete(userId);
+      return;
+    }
+
+    const removedParticipant = space.participants.splice(participantIdx, 1)[0];
+    Logger.info('voice_space_disconnect', 'Removed disconnected participant after grace period', {
+      socketId,
+      userId,
+      spaceId,
+      reason,
+      remainingParticipants: space.participants.length,
+    });
+
+    if (String(removedParticipant.userId) === String(space.hostId)) {
+      closeSpaceAsHost(spaceId, reason);
+    } else if (space.participants.length === 0) {
+      activeVoiceSpaces.delete(spaceId);
+      io.emit('space_closed', { spaceId, reason });
+      Logger.info('voice_space_disconnect', `Deleted empty space ${spaceId} after disconnect timeout`, { spaceId, userId, reason });
+      broadcastActiveSpaces();
+    } else {
+      emitSpaceUpdated(space);
+      broadcastActiveSpaces();
+    }
+
+    userToSpaceMap.delete(userId);
+  }, VOICE_SPACE_DISCONNECT_GRACE_MS);
+
+  pendingVoiceSpaceDisconnects.set(userId, timeoutId);
+  Logger.info('voice_space_disconnect', 'Scheduled voice space cleanup after disconnect grace period', {
+    socketId,
+    userId,
+    spaceId,
+    graceMs: VOICE_SPACE_DISCONNECT_GRACE_MS,
+    reason,
+  });
+}
+
+function cancelVoiceSpaceDisconnectCleanup(userId) {
+  if (!userId) return;
+  const timeoutId = pendingVoiceSpaceDisconnects.get(userId);
+  if (!timeoutId) return;
+  clearTimeout(timeoutId);
+  pendingVoiceSpaceDisconnects.delete(userId);
+  Logger.info('voice_space_disconnect', 'Cancelled scheduled voice space cleanup', { userId });
+}
+
+function closeSpaceAsHost(spaceId, reason = 'host_disconnected') {
+  const space = activeVoiceSpaces.get(spaceId);
+  if (!space) return;
+
+  for (const participant of space.participants) {
+    const participantSocketId = userSockets.get(participant.userId);
+    if (participantSocketId) {
+      io.to(participantSocketId).emit('space_closed_by_host', { spaceId, reason });
+      io.sockets.sockets.get(participantSocketId)?.leave(`space:${spaceId}`);
+    }
+    userToSpaceMap.delete(participant.userId);
+  }
+
+  activeVoiceSpaces.delete(spaceId);
+  io.emit('space_closed', { spaceId });
+  Logger.info('space', `Closed space ${spaceId} because host disconnected`, { reason });
+  broadcastActiveSpaces();
+}
+
 // ✅ Helper: Normalize any incoming ID-like value to a trimmed string
 function normalizeId(id) {
   if (id === undefined || id === null) return '';
@@ -550,6 +740,7 @@ app.get('/room/by-invite/:code', (req, res) => {
 const validateTokenLimiter = createRateLimiter('validate-token', 10, 15 * 60); // 10 per 15 minutes
 const registerLimiter = createRateLimiter('register', 3, 60 * 60); // 3 per hour
 const loginLimiter = createRateLimiter('login', 5, 15 * 60); // 5 per 15 minutes
+const deleteAccountLimiter = createRateLimiter('delete-account', 3, 60 * 60); // 3 per hour
 
 // Google OAuth Token Validation Endpoint (No Firebase required)
 app.post('/auth/validate-token', validateTokenLimiter, asyncHandler(async (req, res) => {
@@ -713,6 +904,9 @@ app.post('/auth/validate-token', validateTokenLimiter, asyncHandler(async (req, 
         email: savedUser.email,
         gender: savedUser.gender || 'other',
         country: savedUser.country || null,
+        status: savedUser.status || null,
+        bio: savedUser.bio || null,
+        interests: Array.isArray(savedUser.interests) ? savedUser.interests : [],
         birthDate: savedUser.birthDate || null,
         avatarColor: savedUser.avatarColor || '#128C7E',
         profileImageUrl: savedUser.profileImageUrl || null,
@@ -786,6 +980,9 @@ app.post('/auth/register', registerLimiter, validateRegistration, asyncHandler(a
       isGuest: false,
       gender: gender ? String(gender).toLowerCase() : 'other',
       country: country || null,
+      status: null,
+      bio: null,
+      interests: [],
       birthDate: birthDateValue,
       avatarColor: avatarColor || '#128C7E',
       profileImageUrl: profileImageUrl || null,
@@ -810,6 +1007,9 @@ app.post('/auth/register', registerLimiter, validateRegistration, asyncHandler(a
         avatarColor: newUser.avatarColor,
         gender: newUser.gender,
         country: newUser.country,
+        status: newUser.status,
+        bio: newUser.bio,
+        interests: newUser.interests,
       },
     }, 'User registered successfully');
   } catch (err) {
@@ -877,6 +1077,9 @@ app.post('/auth/login', loginLimiter, validateAuth, asyncHandler(async (req, res
         isGuest: user.isGuest,
         gender: user.gender,
         country: user.country,
+        status: user.status || null,
+        bio: user.bio || null,
+        interests: Array.isArray(user.interests) ? user.interests : [],
         avatarColor: user.avatarColor,
         profileImageUrl: user.profileImageUrl,
         xp: getUserXp(user),
@@ -1092,6 +1295,9 @@ app.get('/auth/check-email', asyncHandler(async (req, res) => {
           isGuest: existingUser.isGuest || false,
           gender: existingUser.gender || 'other',
           country: existingUser.country || null,
+          status: existingUser.status || null,
+          bio: existingUser.bio || null,
+          interests: Array.isArray(existingUser.interests) ? existingUser.interests : [],
           birthDate: existingUser.birthDate || null,
           avatarColor: existingUser.avatarColor || '#128C7E',
           profileImageUrl: existingUser.profileImageUrl || null,
@@ -1153,9 +1359,13 @@ app.post('/auth/guest-login', guestLimiter, asyncHandler(async (req, res) => {
         userName: guestUser.userName,
         authType: 'GUEST',
         isGuest: true,
-        avatarColor: guestUser.avatarColor,
         gender: guestUser.gender,
         country: guestUser.country,
+        status: guestUser.status || null,
+        bio: guestUser.bio || null,
+        interests: Array.isArray(guestUser.interests) ? guestUser.interests : [],
+        avatarColor: guestUser.avatarColor,
+        profileImageUrl: guestUser.profileImageUrl,
         lastLogin: guestUser.lastLogin,
       },
     }, 'Guest account created');
@@ -1186,27 +1396,38 @@ app.post('/cache/clear', (req, res) => {
 });
 
 // ========== NEW: GET USER PROFILE ENDPOINT ==========
-app.get('/user/:userId', async (req, res) => {
+async function handleGetUserProfile(req, res) {
   if (!isDatabaseConnected()) {
     return sendError(res, 503, 'Database not connected', 'DB_NOT_CONNECTED');
   }
-  try {
-    const { userId } = req.params;
 
+  const userId = String(req.params.userId || '').trim();
+  if (!userId) {
+    return sendError(res, 400, 'Missing userId', 'VALIDATION_ERROR');
+  }
+
+  try {
     // ✅ PERFORMANCE: Check cache first
     let user = userCache.get(userId);
-    
+
     if (!user) {
       // ✅ Optimize query with .lean() for read-only operations
       user = await User.findOne({ userId }).lean().exec();
-      
+
       if (!user) {
         return sendError(res, 404, 'User not found', 'USER_NOT_FOUND');
       }
-      
+
       // ✅ Cache the result for future requests
       userCache.set(userId, user);
     }
+
+    const friendCount = await Friend.countDocuments({
+      $or: [
+        { userId },
+        { friendId: userId, status: 'accepted' },
+      ],
+    });
 
     return sendSuccess(res, {
       user: {
@@ -1217,9 +1438,13 @@ app.get('/user/:userId', async (req, res) => {
         isGuest: user.isGuest,
         gender: user.gender,
         country: user.country,
+        status: user.status || null,
+        bio: user.bio || null,
+        interests: Array.isArray(user.interests) ? user.interests : [],
         avatarColor: user.avatarColor,
         profileImageUrl: user.profileImageUrl,
         xp: getUserXp(user),
+        friendCount,
         profileComplete: user.profileComplete || false,
         createdAt: user.createdAt,
         lastLogin: user.lastLogin,
@@ -1229,8 +1454,26 @@ app.get('/user/:userId', async (req, res) => {
     Logger.error('user/get', 'Error retrieving user', err.message);
     return sendError(res, 500, 'Error retrieving user', { details: err.message });
   }
+}
+
+app.get('/users/profile', async (req, res) => {
+  const userId = String(req.query.userId || '').trim();
+  if (!userId) {
+    return sendError(res, 400, 'Missing userId query parameter', 'VALIDATION_ERROR');
+  }
+  req.params.userId = userId;
+  return handleGetUserProfile(req, res);
 });
 
+app.get('/users/:userId', async (req, res) => {
+  req.params.userId = String(req.params.userId || '').trim();
+  return handleGetUserProfile(req, res);
+});
+
+app.get('/user/:userId', async (req, res) => {
+  req.params.userId = String(req.params.userId || '').trim();
+  return handleGetUserProfile(req, res);
+});
 // ========== NEW: SEARCH USERS ENDPOINT ==========
 app.get('/users/search', async (req, res) => {
   if (!isDatabaseConnected()) {
@@ -1260,7 +1503,7 @@ app.get('/users/search', async (req, res) => {
         { email: fuzzyRegex },
       ],
     })
-      .select('userId userName email gender country avatarColor avatarLetter profileImageUrl profileImagePath createdAt lastLogin xp')
+      .select('userId userName email gender country status bio interests avatarColor avatarLetter profileImageUrl profileImagePath createdAt lastLogin xp')
       .sort({ createdAt: -1 })
       .limit(25)
       .lean()
@@ -1283,12 +1526,9 @@ app.get('/users/search', async (req, res) => {
       email: user.email,
       gender: user.gender,
       country: user.country,
-      avatarColor: user.avatarColor,
-      avatarLetter: (user.userName && user.userName.length > 0) 
-        ? user.userName.charAt(0).toUpperCase() 
-        : 'U',
-      profileImageUrl: user.profileImageUrl,
-      profileImagePath: user.profileImagePath,
+      status: user.status || null,
+      bio: user.bio || null,
+      interests: Array.isArray(user.interests) ? user.interests : [],
       isOnline: false,
       xp: getUserXp(user),
       createdAt: user.createdAt,
@@ -1428,6 +1668,10 @@ app.post('/friends/request/:requestId/accept', async (req, res) => {
       { new: true, lean: true }
     ).exec();
 
+    // ✅ Invalidate cache for both users since friend lists changed
+    userCache.invalidate(userId);
+    userCache.invalidate(friendRequest.userId);
+
     Logger.info('friends/request/accept', 'Friend request accepted', { userId, requestId });
 
     // ✅ OPTIMIZED: Get recipient data from cache
@@ -1527,6 +1771,10 @@ app.post('/friends/remove', async (req, res) => {
       return sendError(res, 404, 'Friend relationship not found');
     }
 
+    // ✅ Invalidate cache for both users since their friend lists changed
+    userCache.invalidate(userId);
+    userCache.invalidate(friendId);
+
     Logger.info('friends/remove', 'Friend removed', { userId, friendId });
 
     return res.status(200).json({
@@ -1563,13 +1811,29 @@ app.get('/friends/list', async (req, res) => {
 
     // Get friend user details with all profile fields
     const friendIds = friends.map((f) => normalizeId(f.userId === userId ? f.friendId : f.userId));
-    const friendUsers = await User.find(
-      { userId: { $in: friendIds }, isActive: true },
-      'userId userName avatarColor avatarLetter profileImageUrl gender country'
-    ).lean();
+    const cachedUsers = userCache.batchGet(friendIds);
+    const missingFriendIds = friendIds.filter((id) => !cachedUsers.get(id));
+
+    let cachedFriendUsers = Array.from(cachedUsers.values()).filter(Boolean);
+    let freshFriendUsers = [];
+    if (missingFriendIds.length > 0) {
+      freshFriendUsers = await User.find(
+        { userId: { $in: missingFriendIds }, isActive: true },
+        'userId userName avatarColor avatarLetter profileImageUrl gender country'
+      ).lean().exec();
+      freshFriendUsers.forEach((u) => userCache.set(normalizeId(u.userId), u));
+    }
+
+    const friendUserMap = new Map();
+    cachedFriendUsers.forEach((u) => friendUserMap.set(normalizeId(u.userId), u));
+    freshFriendUsers.forEach((u) => friendUserMap.set(normalizeId(u.userId), u));
+
+    const orderedFriendUsers = friendIds
+      .map((id) => friendUserMap.get(id))
+      .filter((u) => Boolean(u));
 
     // ✅ Enhanced: Include online status by checking if user has active socket
-    const friendList = friendUsers.map((u) => {
+    const friendList = orderedFriendUsers.map((u) => {
       const normalizedId = normalizeId(u.userId);
       return {
         userId: normalizedId,
@@ -1733,6 +1997,39 @@ function sanitizeGenderInput(genderValue) {
   return null;
 }
 
+function normalizeStringInput(value, maxLength = 0, lowerCase = false) {
+  if (value == null) return null;
+  const trimmed = String(value).trim();
+  if (trimmed === '') return null;
+  const normalized = maxLength > 0 ? trimmed.slice(0, maxLength) : trimmed;
+  return lowerCase ? normalized.toLowerCase() : normalized;
+}
+
+function normalizeInterests(value, maxItems = 20) {
+  if (value == null) return null;
+  const list = Array.isArray(value)
+    ? value
+    : typeof value === 'string'
+      ? value.split(',')
+      : [];
+
+  return list
+    .filter((item) => typeof item === 'string')
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .slice(0, maxItems);
+}
+
+function normalizeBooleanField(value) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'true') return true;
+    if (normalized === 'false') return false;
+  }
+  return null;
+}
+
 // ========== NEW: UPDATE USER PROFILE ENDPOINT ==========
 app.post('/user/:userId/update', validateProfileUpdate, async (req, res) => {
   if (!isDatabaseConnected()) {
@@ -1740,20 +2037,43 @@ app.post('/user/:userId/update', validateProfileUpdate, async (req, res) => {
   }
   try {
     const { userId } = req.params;
-    const { userName, email, gender, country, avatarColor, profileImageUrl, profileImagePath, pictureName, birthDate, authType, isGuest } = req.body;
+    const {
+      userName,
+      email,
+      gender,
+      country,
+      status,
+      bio,
+      interests,
+      avatarColor,
+      profileImageUrl,
+      pictureName,
+      birthDate,
+      authType,
+      isGuest,
+    } = req.body;
+
+    const hasStatus = Object.prototype.hasOwnProperty.call(req.body, 'status');
+    const hasBio = Object.prototype.hasOwnProperty.call(req.body, 'bio');
+    const hasInterests = Object.prototype.hasOwnProperty.call(req.body, 'interests');
+    const hasProfileImageUrl = Object.prototype.hasOwnProperty.call(req.body, 'profileImageUrl');
 
     Logger.info('user/update', 'Received profile update payload', {
       userId,
       hasGender: !!gender,
       hasCountry: !!country,
-      hasImage: !!profileImageUrl,
+      hasImage: hasProfileImageUrl,
+      hasStatus,
+      hasBio,
+      hasInterests,
     });
 
     const updateData = {
       updatedAt: new Date(),
     };
 
-    if (userName) updateData.userName = String(userName).trim();
+    const normalizedUserName = normalizeStringInput(userName);
+    if (normalizedUserName) updateData.userName = normalizedUserName;
 
     const normalizedGender = sanitizeGenderInput(gender);
     if (normalizedGender) {
@@ -1762,24 +2082,47 @@ app.post('/user/:userId/update', validateProfileUpdate, async (req, res) => {
       Logger.warn('user/update', 'Invalid gender value ignored', { userId, gender });
     }
 
-    if (country) updateData.country = String(country).trim();
-    if (avatarColor) updateData.avatarColor = String(avatarColor).trim();
-    if (profileImageUrl) {
-      updateData.profileImageUrl = String(profileImageUrl).trim();
-    } else if (profileImagePath) {
-      Logger.warn(
-        'user/update',
-        'profileImagePath provided but ignored to prevent local file upload to MongoDB',
-        { userId, profileImagePath }
-      );
+    const normalizedCountry = normalizeStringInput(country);
+    if (normalizedCountry) updateData.country = normalizedCountry;
+
+    if (hasStatus) {
+      updateData.status = normalizeStringInput(status, 150);
     }
-    if (pictureName) updateData.pictureName = String(pictureName).trim();
-    if (email) updateData.email = String(email).toLowerCase().trim();
-    if (authType) updateData.authType = String(authType).trim();
-    if (typeof isGuest === 'boolean') updateData.isGuest = isGuest;
-    if (birthDate) {
+
+    if (hasBio) {
+      updateData.bio = normalizeStringInput(bio, 500);
+    }
+
+    if (hasInterests) {
+      updateData.interests = normalizeInterests(interests, 20) || [];
+    }
+
+    if (avatarColor) {
+      updateData.avatarColor = normalizeStringInput(avatarColor);
+    }
+
+    if (hasProfileImageUrl) {
+      updateData.profileImageUrl = normalizeStringInput(profileImageUrl);
+    }
+
+    const normalizedPictureName = normalizeStringInput(pictureName);
+    if (normalizedPictureName) updateData.pictureName = normalizedPictureName;
+
+    const normalizedEmail = normalizeStringInput(email, 0, true);
+    if (normalizedEmail) updateData.email = normalizedEmail;
+
+    if (authType) updateData.authType = normalizeStringInput(authType);
+    const normalizedIsGuest = normalizeBooleanField(isGuest);
+    if (normalizedIsGuest != null) updateData.isGuest = normalizedIsGuest;
+
+    if (birthDate != null) {
       try {
-        updateData.birthDate = new Date(String(birthDate));
+        const parsed = new Date(String(birthDate));
+        if (!Number.isNaN(parsed.getTime())) {
+          updateData.birthDate = parsed;
+        } else {
+          throw new Error('Invalid date');
+        }
       } catch (e) {
         Logger.warn('user/update', 'Invalid birthDate format', { birthDate });
       }
@@ -1791,7 +2134,7 @@ app.post('/user/:userId/update', validateProfileUpdate, async (req, res) => {
       Logger.info('user/update', '✅ Profile marked as complete', { userId });
     }
 
-    const safeFields = ['email', 'userName', 'gender', 'country', 'avatarColor', 'profileImageUrl', 'pictureName', 'birthDate', 'authType', 'isGuest', 'xp', 'profileComplete', 'updatedAt'];
+    const safeFields = ['email', 'userName', 'gender', 'country', 'status', 'bio', 'interests', 'avatarColor', 'profileImageUrl', 'pictureName', 'birthDate', 'authType', 'isGuest', 'xp', 'profileComplete', 'updatedAt'];
     const safeUpdateData = {};
     for (const key of safeFields) {
       if (Object.prototype.hasOwnProperty.call(updateData, key)) {
@@ -1830,6 +2173,9 @@ app.post('/user/:userId/update', validateProfileUpdate, async (req, res) => {
           profileImagePath: user.profileImageUrl || existingMeta.profileImagePath,
           country: user.country || existingMeta.country,
           gender: user.gender || existingMeta.gender,
+          status: user.status || existingMeta.status,
+          bio: user.bio || existingMeta.bio,
+          interests: Array.isArray(user.interests) ? user.interests : existingMeta.interests,
         });
         Logger.info('user/update', '✅ Synchronized socket metadata for updated user', { userId, socketId: connectedSocketId });
       }
@@ -1844,6 +2190,9 @@ app.post('/user/:userId/update', validateProfileUpdate, async (req, res) => {
         userName: user.userName,
         avatarColor: user.avatarColor,
         profileImageUrl: user.profileImageUrl,
+        status: user.status || null,
+        bio: user.bio || null,
+        interests: Array.isArray(user.interests) ? user.interests : [],
         gender: user.gender,
         country: user.country,
         timestamp: Date.now(),
@@ -1865,6 +2214,9 @@ app.post('/user/:userId/update', validateProfileUpdate, async (req, res) => {
         email: user.email,
         gender: user.gender,
         country: user.country,
+        status: user.status || null,
+        bio: user.bio || null,
+        interests: Array.isArray(user.interests) ? user.interests : [],
         avatarColor: user.avatarColor,
         profileImageUrl: user.profileImageUrl,
         profileComplete: user.profileComplete || false,
@@ -1876,6 +2228,210 @@ app.post('/user/:userId/update', validateProfileUpdate, async (req, res) => {
   } catch (err) {
     Logger.error('user/update', 'Error updating user', err.message);
     return sendError(res, 500, 'Error updating user', { details: err.message });
+  }
+});
+
+// ========== DELETE USER ACCOUNT ENDPOINTS ==========
+async function deleteUserAccount(userId, requestContext = {}) {
+  const normalizedUserId = String(userId || '').trim();
+
+  if (!normalizedUserId) {
+    const error = new Error('Invalid userId');
+    error.code = 'INVALID_USER_ID';
+    throw error;
+  }
+
+  Logger.info('user/delete', 'Processing account deletion request', {
+    userId: normalizedUserId,
+    timestamp: new Date().toISOString(),
+    requestContext: requestContext && Object.keys(requestContext).length ? requestContext : undefined,
+  });
+
+  const user = await User.findOne({ userId: normalizedUserId }).lean().exec();
+  if (!user) {
+    const error = new Error('User not found');
+    error.code = 'USER_NOT_FOUND';
+    error.statusCode = 404;
+    throw error;
+  }
+
+  const deleteUserResult = await User.deleteOne({ userId: normalizedUserId });
+  if (deleteUserResult.deletedCount === 0) {
+    const error = new Error('Failed to delete user account');
+    error.code = 'DELETE_FAILED';
+    error.statusCode = 500;
+    throw error;
+  }
+
+  Logger.info('user/delete', '✅ User record deleted', { userId: normalizedUserId });
+
+  const friendDeleteResult = await Friend.deleteMany({
+    $or: [
+      { userId: normalizedUserId },
+      { friendId: normalizedUserId },
+    ],
+  });
+  Logger.info('user/delete', '✅ Friend relationships cleaned up', {
+    userId: normalizedUserId,
+    deletedCount: friendDeleteResult.deletedCount,
+  });
+
+  const blockedDeleteResult = await BlockedUser.deleteMany({
+    $or: [
+      { userId: normalizedUserId },
+      { blockedByUserId: normalizedUserId },
+    ],
+  });
+  Logger.info('user/delete', '✅ Blocked user records cleaned up', {
+    userId: normalizedUserId,
+    deletedCount: blockedDeleteResult.deletedCount,
+  });
+
+  const reportDeleteResult = await Report.deleteMany({
+    $or: [
+      { reportedUserId: normalizedUserId },
+      { reporterId: normalizedUserId },
+    ],
+  });
+  Logger.info('user/delete', '✅ Report records cleaned up', {
+    userId: normalizedUserId,
+    deletedCount: reportDeleteResult.deletedCount,
+  });
+
+  userCache.invalidate(normalizedUserId);
+  Logger.info('user/delete', '✅ User cache invalidated', { userId: normalizedUserId });
+
+  const userSocketId = userSockets.get(normalizedUserId);
+  if (userSocketId) {
+    try {
+      io.to(userSocketId).emit('account_deleted_notification', {
+        reason: 'Your account has been successfully deleted.',
+        timestamp: Date.now(),
+      });
+
+      decomposeRoom(userSocketId, 'video');
+      decomposeRoom(userSocketId, 'chat');
+
+      const socket = io.of('/').sockets.get(userSocketId);
+      if (socket) {
+        socket.disconnect(true);
+        Logger.info('user/delete', '✅ User socket disconnected', {
+          userId: normalizedUserId,
+          socketId: userSocketId,
+        });
+      }
+    } catch (socketErr) {
+      Logger.warn('user/delete', 'Error disconnecting user socket', {
+        userId: normalizedUserId,
+        socketId: userSocketId,
+        error: socketErr && socketErr.message,
+      });
+    }
+  }
+
+  userSockets.delete(normalizedUserId);
+  userGenderPreferences.delete(normalizedUserId);
+  socketQueues.delete(userSocketId);
+  offlineMessages.delete(normalizedUserId);
+
+  Logger.info('user/delete', '✅ User account completely deleted', {
+    userId: normalizedUserId,
+    deletedAt: new Date().toISOString(),
+    cleanupStats: {
+      friendshipsCleaned: friendDeleteResult.deletedCount,
+      blocksCleaned: blockedDeleteResult.deletedCount,
+      reportsCleaned: reportDeleteResult.deletedCount,
+    },
+  });
+
+  return {
+    message: 'Account deleted successfully',
+    userId: normalizedUserId,
+    deletedAt: new Date().toISOString(),
+  };
+}
+
+app.get('/account/delete', (req, res) => {
+  res.sendFile(path.join(__dirname, 'delete-account.html'));
+});
+
+app.post('/auth/verify-account', deleteAccountLimiter, async (req, res) => {
+  if (!isDatabaseConnected()) {
+    return sendError(res, 503, 'Database not connected', 'DB_NOT_CONNECTED');
+  }
+
+  try {
+    const userId = req.body && (req.body.userId || req.body.id);
+    const normalizedUserId = String(userId || '').trim();
+
+    if (!normalizedUserId) {
+      return sendError(res, 400, 'User ID is required', 'INVALID_USER_ID');
+    }
+
+    const user = await User.findOne({ userId: normalizedUserId }).lean().exec();
+    if (!user) {
+      return sendError(res, 404, 'User not found', 'USER_NOT_FOUND');
+    }
+
+    return sendSuccess(res, {
+      exists: true,
+      userId: user.userId,
+      userName: user.userName,
+      email: user.email,
+      profileComplete: user.profileComplete || false,
+    }, 'Account verified');
+  } catch (err) {
+    Logger.error('user/verify', 'Error verifying user account', err && err.message);
+    return sendError(res, 500, 'Error verifying user account', { details: err.message });
+  }
+});
+
+app.post('/auth/delete-account', deleteAccountLimiter, async (req, res) => {
+  if (!isDatabaseConnected()) {
+    return sendError(res, 503, 'Database not connected', 'DB_NOT_CONNECTED');
+  }
+
+  try {
+    const userId = req.body && (req.body.userId || req.body.id);
+    const result = await deleteUserAccount(userId, { source: 'auth/delete-account', body: req.body });
+    return sendSuccess(res, result, 'User account deleted');
+  } catch (err) {
+    Logger.error('user/delete', 'Error deleting user account', err && err.message);
+    const statusCode = err && err.statusCode ? err.statusCode : 500;
+    const code = err && err.code ? err.code : 'DELETE_FAILED';
+    return sendError(res, statusCode, err && err.message ? err.message : 'Error deleting user account', code);
+  }
+});
+
+app.delete('/auth/account/:userId', deleteAccountLimiter, async (req, res) => {
+  if (!isDatabaseConnected()) {
+    return sendError(res, 503, 'Database not connected', 'DB_NOT_CONNECTED');
+  }
+
+  try {
+    const result = await deleteUserAccount(req.params.userId, { source: 'auth/account/delete' });
+    return sendSuccess(res, result, 'User account deleted');
+  } catch (err) {
+    Logger.error('user/delete', 'Error deleting user account', err && err.message);
+    const statusCode = err && err.statusCode ? err.statusCode : 500;
+    const code = err && err.code ? err.code : 'DELETE_FAILED';
+    return sendError(res, statusCode, err && err.message ? err.message : 'Error deleting user account', code);
+  }
+});
+
+app.delete('/user/:userId/delete', deleteAccountLimiter, async (req, res) => {
+  if (!isDatabaseConnected()) {
+    return sendError(res, 503, 'Database not connected', 'DB_NOT_CONNECTED');
+  }
+
+  try {
+    const result = await deleteUserAccount(req.params.userId, { source: 'user/delete' });
+    return sendSuccess(res, result, 'User account deleted');
+  } catch (err) {
+    Logger.error('user/delete', 'Error deleting user account', err && err.message);
+    const statusCode = err && err.statusCode ? err.statusCode : 500;
+    const code = err && err.code ? err.code : 'DELETE_FAILED';
+    return sendError(res, statusCode, err && err.message ? err.message : 'Error deleting user account', code);
   }
 });
 
@@ -2546,6 +3102,26 @@ const groupChatRooms = new Map(); // roomName -> Set of socketIds
 const messageIdCache = new Map(); // groupName -> { ids: Set, timestamp }
 const MESSAGE_CACHE_TIMEOUT = 30000; // 30 seconds
 
+function getSafeAvatarLetter(userName, fallback = 'U') {
+  const trimmed = typeof userName === 'string' ? userName.trim() : '';
+  if (!trimmed) return fallback;
+  return trimmed.charAt(0).toUpperCase();
+}
+
+function cleanupSocketUserState(userId, socketId) {
+  const normalizedUserId = normalizeId(userId);
+  if (normalizedUserId) {
+    userSockets.delete(normalizedUserId);
+    userGenderPreferences.delete(normalizedUserId);
+    userToSpaceMap.delete(normalizedUserId);
+    pendingVoiceSpaceDisconnects.delete(normalizedUserId);
+  }
+  if (socketId) {
+    socketMetadata.delete(socketId);
+    socketQueues.delete(socketId);
+  }
+}
+
 // ========== SOCKET.IO CONNECTION HANDLER ==========
 io.on('connection', (socket) => {
   Logger.info('connection', '🟢 Client connected', { socketId: socket.id });
@@ -2654,7 +3230,7 @@ io.on('connection', (socket) => {
         userId: normalizedUserId,
         userName: userData.userName,
         avatarColor: userData.avatarColor || '#128C7E',
-        avatarLetter: userData.avatarLetter || userData.userName[0].toUpperCase(),
+        avatarLetter: userData.avatarLetter || getSafeAvatarLetter(userData.userName),
         profileImagePath: profileImagePath || null,
         joinedAt: Date.now(),
         // NOTE: Email, authType, isGuest are stored LOCALLY on phone
@@ -2703,6 +3279,66 @@ io.on('connection', (socket) => {
       socket.emit('error', { message: 'Registration failed' });
       if (typeof callback === 'function') {
         callback({ success: false, error: 'Registration failed' });
+      }
+    }
+  });
+
+  socket.on('_room_reconnected', (data, callback) => {
+    try {
+      const userId = normalizeId(
+        data?.userId || socket.data?.userId || socket.handshake?.query?.userId,
+      );
+      if (!userId) {
+        if (typeof callback === 'function') {
+          callback({ success: false, error: 'Missing userId' });
+        }
+        return;
+      }
+
+      const prevSocketId = userSockets.get(userId);
+      if (prevSocketId && prevSocketId !== socket.id) {
+        socketMetadata.delete(prevSocketId);
+      }
+
+      cancelVoiceSpaceDisconnectCleanup(userId);
+
+      const existingMeta = socketMetadata.get(socket.id) || {};
+      socketMetadata.set(socket.id, {
+        ...existingMeta,
+        userId,
+        reconnectedAt: Date.now(),
+      });
+      userSockets.set(userId, socket.id);
+      socket.data = socket.data || {};
+      socket.data.userId = userId;
+
+      const pendingSpaceId = userToSpaceMap.get(userId);
+      if (pendingSpaceId) {
+        const pendingSpace = activeVoiceSpaces.get(pendingSpaceId);
+        if (pendingSpace && pendingSpace.participants.some((p) => String(p.userId) === String(userId))) {
+          socket.join(`space:${pendingSpaceId}`);
+          Logger.info('_room_reconnected', 'Auto-joined socket back into voice space on reconnect', {
+            userId,
+            socketId: socket.id,
+            spaceId: pendingSpaceId,
+          });
+        }
+      }
+
+      Logger.info('_room_reconnected', 'Socket reconnected and re-registered', {
+        userId,
+        socketId: socket.id,
+        previousSocketId: prevSocketId,
+      });
+
+      broadcastStats();
+      if (typeof callback === 'function') {
+        callback({ success: true, userId });
+      }
+    } catch (err) {
+      Logger.error('_room_reconnected', 'Error handling reconnect', err.message);
+      if (typeof callback === 'function') {
+        callback({ success: false, error: 'Reconnect failed' });
       }
     }
   });
@@ -3034,6 +3670,8 @@ io.on('connection', (socket) => {
       if (callback) callback({ success: false, error: 'Failed to list rooms' });
     }
   });
+
+  // Voice space handlers consolidated later in this file (use in-memory `activeVoiceSpaces`)
 
   // ✅ NEW: Report a user (MongoDB-backed)
   socket.on('report_user', async (data, callback) => {
@@ -3494,6 +4132,137 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ===== Voice Space WebRTC Signaling =====
+  // Offer from a participant to the host for space-based voice connection
+  socket.on('space_webrtc_offer', (data) => {
+    try {
+      const spaceId = data && data.spaceId ? String(data.spaceId) : null;
+      if (!spaceId) return;
+      const space = activeVoiceSpaces.get(spaceId);
+      if (!space) return;
+      const hostSocketId = userSockets.get(space.hostId);
+      if (hostSocketId) {
+        const out = Object.assign({}, data || {}, { fromUserId: (socketMetadata.get(socket.id) || {}).userId, forwardedAt: Date.now() });
+        io.to(hostSocketId).emit('space_webrtc_offer', out);
+      }
+    } catch (err) {
+      Logger.error('space_webrtc_offer', 'Error forwarding space offer', err && err.message);
+    }
+  });
+
+  // Answer from host to a specific participant
+  socket.on('space_webrtc_answer', (data) => {
+    try {
+      const targetUserId = data && (data.targetUserId || data.to || data.userId) ? String(data.targetUserId || data.to || data.userId) : null;
+      if (!targetUserId) return;
+      const targetSocketId = userSockets.get(targetUserId);
+      if (targetSocketId) io.to(targetSocketId).emit('space_webrtc_answer', data);
+    } catch (err) {
+      Logger.error('space_webrtc_answer', 'Error forwarding space answer', err && err.message);
+    }
+  });
+
+  // ICE candidate forwarding for space connections
+  socket.on('space_webrtc_ice', (data) => {
+    try {
+      const targetUserId = data && (data.targetUserId || data.to || data.userId) ? String(data.targetUserId || data.to || data.userId) : null;
+      if (!targetUserId) return;
+      const targetSocketId = userSockets.get(targetUserId);
+      if (targetSocketId) io.to(targetSocketId).emit('space_webrtc_ice', data);
+    } catch (err) {
+      Logger.error('space_webrtc_ice', 'Error forwarding space ICE', err && err.message);
+    }
+  });
+
+  // ===== Voice Space Speak Request Flow =====
+  socket.on('request_speak', (data) => {
+    try {
+      const spaceId = data && data.spaceId ? String(data.spaceId) : null;
+      if (!spaceId) return;
+      const space = activeVoiceSpaces.get(spaceId);
+      if (!space) return;
+      const hostSocketId = userSockets.get(space.hostId);
+      if (hostSocketId) {
+        io.to(hostSocketId).emit('speak_request', {
+          spaceId,
+          userId: data.userId,
+          userName: data.userName || 'Guest',
+        });
+      }
+    } catch (err) {
+      Logger.error('request_speak', 'Error broadcasting speak request', err && err.message);
+    }
+  });
+
+  socket.on('approve_speak_request', (data) => {
+    try {
+      const spaceId = data && data.spaceId ? String(data.spaceId) : null;
+      const userId = data && data.userId ? String(data.userId) : null;
+      const userName = data && data.userName ? String(data.userName) : null;
+      if (!spaceId || (!userId && !userName)) return;
+
+      const space = activeVoiceSpaces.get(spaceId);
+      if (space && userId) {
+        const participant = space.participants.find((p) => p.userId === userId);
+        if (participant) {
+          participant.role = 'Speaker';
+          emitSpaceUpdated(space);
+          broadcastActiveSpaces();
+        }
+      }
+
+      // Find the user by ID first, then by name
+      let targetSocketId = null;
+      if (userId) targetSocketId = userSockets.get(userId);
+      if (!targetSocketId && userName) {
+        for (const [uId, sockId] of userSockets.entries()) {
+          const meta = socketMetadata.get(sockId);
+          if (meta && meta.userName === userName) {
+            targetSocketId = sockId;
+            break;
+          }
+        }
+      }
+
+      if (targetSocketId) {
+        io.to(targetSocketId).emit('speak_request_approved', {
+          spaceId,
+          userName,
+          userId,
+        });
+        Logger.info('approve_speak_request', `Approved ${userName || userId} to speak`, {
+          spaceId,
+          userId,
+        });
+      }
+    } catch (err) {
+      Logger.error('approve_speak_request', 'Error approving speak request', err && err.message);
+    }
+  });
+
+  socket.on('decline_speak_request', (data) => {
+    try {
+      const spaceId = data && data.spaceId ? String(data.spaceId) : null;
+      const userName = data && data.userName ? String(data.userName) : null;
+      if (!spaceId || !userName) return;
+
+      // Find the user by name and notify them
+      for (const [userId, sockId] of userSockets.entries()) {
+        const meta = socketMetadata.get(sockId);
+        if (meta && meta.userName === userName) {
+          io.to(sockId).emit('speak_request_declined', {
+            spaceId,
+            userName,
+            userId,
+          });
+          break;
+        }
+      }
+    } catch (err) {
+      Logger.error('decline_speak_request', 'Error declining speak request', err && err.message);
+    }
+  });
+
   // Chat message relay
   socket.on('message', (data) => {
     try {
@@ -3697,6 +4466,9 @@ io.on('connection', (socket) => {
         avatarLetter: data.avatarLetter || senderMeta.avatarLetter,
         gender: data.gender || null,
         country: data.country || null,
+        status: data.status ?? senderMeta.status ?? null,
+        bio: data.bio ?? senderMeta.bio ?? null,
+        interests: Array.isArray(data.interests) ? data.interests : (Array.isArray(senderMeta.interests) ? senderMeta.interests : []),
         profileImagePath: data.profileImagePath ?? senderMeta.profileImagePath ?? null,
         profileImageUrl: data.profileImageUrl ?? senderMeta.profileImageUrl ?? null,
         timestamp: Date.now(),
@@ -3710,6 +4482,9 @@ io.on('connection', (socket) => {
         avatarLetter: profileUpdate.avatarLetter,
         profileImagePath: profileUpdate.profileImagePath || senderMeta.profileImagePath,
         profileImageUrl: profileUpdate.profileImageUrl || senderMeta.profileImageUrl,
+        status: profileUpdate.status || senderMeta.status,
+        bio: profileUpdate.bio || senderMeta.bio,
+        interests: profileUpdate.interests || senderMeta.interests,
       });
 
       // Broadcast update to all connected clients
@@ -3840,10 +4615,420 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Disconnect
+  // ========== VOICE SPACE HANDLERS (IN-MEMORY, VOLATILE) ==========
+
+  // Get all active voice spaces (broadcast from in-memory store)
+  socket.on('get_active_spaces', (data, callback) => {
+    try {
+      const spaces = Array.from(activeVoiceSpaces.values()).sort(
+        (a, b) => b.createdAt - a.createdAt
+      );
+
+      if (callback) callback({ success: true, spaces });
+      Logger.info('get_active_spaces', `📡 Returned ${spaces.length} active spaces`);
+    } catch (error) {
+      Logger.error('get_active_spaces', 'Error fetching active spaces', error.message);
+      if (callback) callback({ success: false, error: error.message });
+    }
+  });
+
+  // Create a new voice space
+  socket.on('create_space', async (data, callback) => {
+    try {
+      const incomingUser = data?.user || null;
+      const incomingUserId = normalizeId(data.userId || incomingUser?.userId || socket.data?.userId);
+      const userNamePayload = incomingUser?.userName || data.userName || socket.data?.userName;
+      const userId = incomingUserId;
+      const spaceName = String(data.spaceName || 'Voice Space').substring(0, 100);
+      const description = String(data.description || '').substring(0, 300);
+
+      if (!userId) {
+        if (callback) callback({ success: false, error: 'Missing userId' });
+        return;
+      }
+
+      // Auto-register socket if not already registered and client supplied user data
+      let userMeta = socketMetadata.get(socket.id);
+      if (!userMeta && (incomingUserId || userNamePayload)) {
+        const userPayload = incomingUser || {
+          userId: data.userId || socket.data?.userId,
+          userName: data.userName || socket.data?.userName,
+          avatarColor: data.avatarColor,
+          avatarLetter: data.avatarLetter,
+          profileImagePath: data.profileImagePath,
+        };
+        const validation = validateUserData(userPayload);
+        if (validation.valid) {
+          const normalizedId = normalizeId(userPayload.userId);
+          socketMetadata.set(socket.id, {
+            userId: normalizedId,
+            userName: userPayload.userName,
+            avatarColor: userPayload.avatarColor || '#128C7E',
+            avatarLetter: userPayload.avatarLetter || (userPayload.userName ? userPayload.userName[0].toUpperCase() : 'H'),
+            profileImagePath: userPayload.profileImagePath || null,
+            joinedAt: Date.now(),
+          });
+          socket.data = socket.data || {};
+          socket.data.userId = normalizedId;
+          socket.data.userName = userPayload.userName;
+          userSockets.set(normalizedId, socket.id);
+          userMeta = socketMetadata.get(socket.id);
+          Logger.info('create_space', 'Auto-registered user for create_space', { socketId: socket.id, userId: normalizedId });
+          broadcastStats();
+        }
+      }
+
+      const existingHostSpace = Array.from(activeVoiceSpaces.values()).find(
+        (space) => String(space.hostId) === userId,
+      );
+      if (existingHostSpace) {
+        if (callback) callback({
+          success: false,
+          error: 'You already have one active voice space. Close it before creating a new one.',
+        });
+        return;
+      }
+
+      const profileMeta = await resolveUserProfileMetadata(userId, userMeta, userNamePayload || 'Host', '#8A2BE2', 'H');
+
+      // Generate unique spaceId
+      const spaceId = `space_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+      const newSpace = {
+        spaceId,
+        name: spaceName,
+        description: description,
+        hostId: String(userId),
+        hostName: profileMeta.userName,
+        hostAvatar: profileMeta.avatarLetter,
+        hostAvatarColor: profileMeta.avatarColor,
+        hostProfileImageUrl: profileMeta.profileImageUrl,
+        isPrivate: data.isPrivate || false,
+        speakerLimit: Math.min(Math.max(data.speakerLimit || 5, 1), 50),
+        roomType: String(data.roomType || 'FREE').substring(0, 20),
+        participants: [buildParticipant(userId, profileMeta, 'Host')],
+        createdAt: Date.now(),
+        status: 'active',
+      };
+
+      activeVoiceSpaces.set(spaceId, newSpace);
+      userToSpaceMap.set(userId, spaceId);
+      socket.join(`space:${spaceId}`);
+
+      Logger.info('create_space', `✨ Space created: ${spaceId}`, {
+        spaceName,
+        hostId: userId,
+        hostName: profileMeta.userName,
+      });
+
+      // Emit updated space state to the host immediately
+      emitSpaceUpdated(newSpace);
+      socket.emit('space_created', {
+        success: true,
+        space: newSpace,
+        assignedRole: 'Host',
+      });
+
+      // Broadcast updated spaces list to ALL clients
+      broadcastActiveSpaces();
+
+      if (callback) {
+        callback({
+          success: true,
+          space: {
+            spaceId: newSpace.spaceId,
+            name: newSpace.name,
+            description: newSpace.description,
+            hostId: newSpace.hostId,
+            hostName: newSpace.hostName,
+            speakerLimit: newSpace.speakerLimit,
+            roomType: newSpace.roomType,
+            currentSpeakers: newSpace.participants.filter((p) => p.role === 'Speaker').length,
+            currentListeners: newSpace.participants.filter((p) => p.role === 'Listener').length,
+          },
+          assignedRole: 'Host',
+        });
+      }
+    } catch (error) {
+      Logger.error('create_space', 'Error creating space', error.message);
+      if (callback) callback({ success: false, error: error.message });
+    }
+  });
+
+  // Join a voice space
+  socket.on('join_space', async (data, callback) => {
+    try {
+      const incomingUser = data?.user || null;
+      const incomingUserId = normalizeId(data.userId || incomingUser?.userId || socket.data?.userId);
+      const userNamePayload = incomingUser?.userName || data.userName || socket.data?.userName;
+      const userId = incomingUserId;
+      const spaceId = String(data.spaceId || '');
+      const requestedRole = data.requestedRole || 'Listener';
+
+      if (!userId || !spaceId) {
+        if (callback) callback({ success: false, error: 'Missing userId or spaceId' });
+        return;
+      }
+
+      const space = activeVoiceSpaces.get(spaceId);
+      if (!space) {
+        if (callback) callback({ success: false, error: 'Space not found or expired' });
+        return;
+      }
+
+      // Check if user already in space
+      const existingParticipant = space.participants.find((p) => p.userId === userId);
+      if (existingParticipant) {
+        // If the socket was previously disconnected or retries joining, treat as idempotent success.
+        // Ensure socket is in the room and mappings are set, then respond with success instead of error.
+        try {
+          cancelVoiceSpaceDisconnectCleanup(userId);
+          userToSpaceMap.set(userId, spaceId);
+          socket.join(`space:${spaceId}`);
+          // Update socket metadata mapping if missing
+          if (!socketMetadata.get(socket.id)) {
+            socketMetadata.set(socket.id, {
+              userId,
+              userName: existingParticipant.userName,
+              avatarColor: existingParticipant.avatarColor,
+              avatarLetter: existingParticipant.avatarLetter,
+              profileImagePath: existingParticipant.profileImageUrl || null,
+              joinedAt: Date.now(),
+            });
+            userSockets.set(userId, socket.id);
+          }
+
+          // Re-emit updated state to the re-joining socket
+          socket.emit('space_joined', {
+            success: true,
+            space,
+            assignedRole: existingParticipant.role,
+          });
+
+          // Also invoke callback if provided
+          if (callback) {
+            callback({ success: true, space, assignedRole: existingParticipant.role });
+          }
+
+          // Broadcast updates to other participants (no participant list change expected)
+          emitSpaceUpdated(space);
+          broadcastActiveSpaces();
+        } catch (err) {
+          Logger.error('join_space', 'Error handling idempotent join for existing participant', err?.message || err);
+          if (callback) callback({ success: false, error: 'Already in space' });
+        }
+        return;
+      }
+
+      // Auto-register socket if not already registered and client supplied user data
+      let userMeta = socketMetadata.get(socket.id);
+      if (!userMeta && (incomingUserId || userNamePayload)) {
+        const userPayload = incomingUser || {
+          userId: data.userId,
+          userName: data.userName,
+          avatarColor: data.avatarColor,
+          avatarLetter: data.avatarLetter,
+          profileImagePath: data.profileImagePath,
+        };
+        const validation = validateUserData(userPayload);
+        if (validation.valid) {
+          const normalizedId = normalizeId(userPayload.userId);
+          socketMetadata.set(socket.id, {
+            userId: normalizedId,
+            userName: userPayload.userName,
+            avatarColor: userPayload.avatarColor || '#128C7E',
+            avatarLetter: userPayload.avatarLetter || (userPayload.userName ? userPayload.userName[0].toUpperCase() : 'U'),
+            profileImagePath: userPayload.profileImagePath || null,
+            joinedAt: Date.now(),
+          });
+          socket.data = socket.data || {};
+          socket.data.userId = normalizedId;
+          userSockets.set(normalizedId, socket.id);
+          userMeta = socketMetadata.get(socket.id);
+          Logger.info('join_space', 'Auto-registered user for join_space', { socketId: socket.id, userId: normalizedId });
+          broadcastStats();
+        }
+      }
+
+      userMeta = userMeta || socketMetadata.get(socket.id) || {};
+      const participantMeta = await resolveUserProfileMetadata(userId, userMeta, userNamePayload || 'Guest', '#128C7E', 'U');
+
+      // Determine role: FREE rooms auto-assign open speaker slots, otherwise listener by default.
+      let assignedRole = 'Listener';
+      const normalizedRoomType = String(space.roomType || 'FREE').toUpperCase();
+      const currentSpeakers = space.participants.filter((p) => p.role === 'Speaker').length;
+
+      if (normalizedRoomType === 'FREE') {
+        if (currentSpeakers < space.speakerLimit) {
+          assignedRole = 'Speaker';
+        }
+      } else if (requestedRole === 'Speaker') {
+        if (currentSpeakers < space.speakerLimit) {
+          assignedRole = 'Speaker';
+        }
+      }
+
+      // Add participant to space (use fresh profile data when available)
+      space.participants.push(buildParticipant(userId, participantMeta, assignedRole));
+
+      userToSpaceMap.set(userId, spaceId);
+      socket.join(`space:${spaceId}`);
+
+      try {
+        const room = io.sockets.adapter.rooms.get(`space:${spaceId}`);
+        const socketsInRoom = room ? room.size : 0;
+        Logger.info('join_space', `User ${participantMeta.userName} (${userId}) joined space ${spaceId} as ${assignedRole} (participants=${space.participants.length}, socketsInRoom=${socketsInRoom})`);
+      } catch (err) {
+        Logger.info('join_space', `User ${participantMeta.userName} (${userId}) joined space ${spaceId} as ${assignedRole} (participants=${space.participants.length})`);
+      }
+
+      Logger.info('join_space', `👤 ${participantMeta.userName} (${userId}) joined space ${spaceId} as ${assignedRole}`, {
+        spaceId,
+        userId,
+        role: assignedRole,
+        totalParticipants: space.participants.length,
+      });
+
+      // Notify all participants in space of the update
+      emitSpaceUpdated(space);
+      socket.emit('space_joined', {
+        success: true,
+        space,
+        assignedRole,
+      });
+
+      // Broadcast updated spaces list globally
+      broadcastActiveSpaces();
+
+      if (callback) {
+        callback({
+          success: true,
+          space,
+          assignedRole,
+        });
+      }
+    } catch (error) {
+      Logger.error('join_space', 'Error joining space', error.message);
+      if (callback) callback({ success: false, error: error.message });
+    }
+  });
+
+  // Leave a voice space
+  socket.on('leave_space', (data, callback) => {
+    try {
+      const userId = normalizeId(data.userId);
+      const spaceId = String(data.spaceId || '');
+
+      if (!userId || !spaceId) {
+        if (callback) callback({ success: false, error: 'Missing userId or spaceId' });
+        return;
+      }
+
+      const space = activeVoiceSpaces.get(spaceId);
+      if (!space) {
+        if (callback) callback({ success: false, error: 'Space not found' });
+        return;
+      }
+
+      const participantIndex = space.participants.findIndex((p) => p.userId === userId);
+      if (participantIndex === -1) {
+        if (callback) callback({ success: false, error: 'Not in space' });
+        return;
+      }
+
+      const leftParticipant = space.participants[participantIndex];
+      space.participants.splice(participantIndex, 1);
+
+      userToSpaceMap.delete(userId);
+      socket.leave(`space:${spaceId}`);
+
+      Logger.info('leave_space', `👋 ${leftParticipant.userName} left space ${spaceId}`, {
+        spaceId,
+        userId,
+        remainingParticipants: space.participants.length,
+      });
+
+      if (leftParticipant.userId === space.hostId) {
+        closeSpaceAsHost(spaceId, 'host_disconnected');
+      } else if (space.participants.length === 0) {
+        activeVoiceSpaces.delete(spaceId);
+        io.emit('space_closed', { spaceId });
+        Logger.info('leave_space', `🗑️ Space ${spaceId} deleted (no participants)`, {});
+      } else {
+        emitSpaceUpdated(space);
+      }
+
+      // Broadcast updated spaces list globally
+      broadcastActiveSpaces();
+
+      if (callback) callback({ success: true });
+    } catch (error) {
+      Logger.error('leave_space', 'Error leaving space', error.message);
+      if (callback) callback({ success: false, error: error.message });
+    }
+  });
+
+  socket.on('space_left', (data, callback) => {
+    socket.emit('leave_space', data, callback);
+  });
+
+  // Close a voice space as the host
+  function handleCloseSpaceRequest(data, callback) {
+    try {
+      const userId = normalizeId(data.userId);
+      const spaceId = String(data.spaceId || '');
+
+      if (!userId || !spaceId) {
+        if (callback) callback({ success: false, error: 'Missing userId or spaceId' });
+        return;
+      }
+
+      const space = activeVoiceSpaces.get(spaceId);
+      if (!space) {
+        if (callback) callback({ success: false, error: 'Space not found' });
+        return;
+      }
+
+      if (String(space.hostId) !== String(userId)) {
+        if (callback) callback({ success: false, error: 'Only the host can close this space' });
+        return;
+      }
+
+      closeSpaceAsHost(spaceId, 'host_closed');
+      if (callback) callback({ success: true });
+    } catch (error) {
+      Logger.error('close_space', 'Error closing space', error.message);
+      if (callback) callback({ success: false, error: error.message });
+    }
+  }
+
+  socket.on('close_space', handleCloseSpaceRequest);
+  socket.on('space_close', handleCloseSpaceRequest);
+  socket.on('close_space_by_host', handleCloseSpaceRequest);
+
+  // Disconnect - Clean up user's voice spaces
   socket.on('disconnect', (reason) => {
     try {
       Logger.info('disconnect', `Client disconnected: ${reason}`, { socketId: socket.id });
+
+      // ✅ NEW: Auto-leave voice spaces
+      const userData = socketMetadata.get(socket.id);
+      if (userData) {
+        cancelVoiceSpaceDisconnectCleanup(userData.userId);
+        const userSpaceId = userToSpaceMap.get(userData.userId);
+        if (userSpaceId) {
+          const space = activeVoiceSpaces.get(userSpaceId);
+          if (space) {
+            const isHost = String(space.hostId) === String(userData.userId);
+            scheduleVoiceSpaceDisconnectCleanup(
+              userData.userId,
+              userSpaceId,
+              isHost ? 'host_disconnected' : 'participant_disconnected',
+              socket.id,
+            );
+          }
+        }
+      }
 
       // Decompose pairings
       if (videoPairings.has(socket.id)) {
@@ -3860,13 +5045,7 @@ io.on('connection', (socket) => {
       if (chatIdx !== -1) chatQueue.splice(chatIdx, 1);
 
       // Clean metadata
-      const userData = socketMetadata.get(socket.id);
-      if (userData) {
-        userSockets.delete(userData.userId);
-        // ✅ NEW: Clean gender preference on disconnect
-        userGenderPreferences.delete(userData.userId);
-      }
-      socketMetadata.delete(socket.id);
+      cleanupSocketUserState(userData?.userId, socket.id);
       // ✅ FIX: Remove this socket from any groupChatRooms to avoid memory leaks
       try {
         for (const [groupName, roomSet] of groupChatRooms.entries()) {
@@ -4229,6 +5408,123 @@ io.on('connection', (socket) => {
     }
   });
 
+  // User sends message to room using a generic roomType
+  socket.on('send_room_message', (data, callback) => {
+    try {
+      const roomType = data && data.roomType ? String(data.roomType).trim().toLowerCase() : null;
+      if (!roomType) {
+        if (callback) callback({ success: false, error: 'Missing roomType' });
+        return;
+      }
+
+      if (roomType === 'group') {
+        const groupName = data.groupName || data.roomName || data.roomId || null;
+        const message = data && data.message ? String(data.message).trim() : null;
+        const mediaUrl = data && data.mediaUrl ? String(data.mediaUrl).trim() : null;
+        const mediaType = data && data.mediaType ? String(data.mediaType).trim() : null;
+        const clientMessageId = data && data.messageId ? String(data.messageId).trim() : null;
+
+        if (!groupName || (!message && !mediaUrl)) {
+          if (callback) callback({ success: false, error: 'Invalid group message data' });
+          return;
+        }
+
+        const roomSet = groupChatRooms.get(groupName);
+        if (!roomSet || !roomSet.has(socket.id)) {
+          if (callback) callback({ success: false, error: 'Not in this group' });
+          return;
+        }
+
+        const serverMessageId = clientMessageId || `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        if (!messageIdCache.has(groupName)) {
+          messageIdCache.set(groupName, { ids: new Set(), timestamp: Date.now() });
+        }
+
+        const cache = messageIdCache.get(groupName);
+        if (cache.ids.has(serverMessageId)) {
+          if (callback) callback({ success: true, duplicate: true, messageId: serverMessageId });
+          return;
+        }
+
+        cache.ids.add(serverMessageId);
+        cache.timestamp = Date.now();
+
+        const senderMeta = socketMetadata.get(socket.id) || {};
+        const messageData = {
+          userId: senderMeta.userId || data?.userId || '',
+          userName: (senderMeta.userName || data?.userName || 'Unknown User').substring(0, 50),
+          message: message ? message.substring(0, 1000) : null,
+          mediaUrl: mediaUrl || null,
+          mediaType: mediaType || null,
+          senderProfileImagePath: senderMeta.profileImagePath || data?.senderProfileImagePath || data?.profileImagePath || data?.profile_image_path || null,
+          profileImagePath: senderMeta.profileImagePath || data?.profileImagePath || data?.senderProfileImagePath || data?.profile_image_path || null,
+          avatarColor: senderMeta.avatarColor || data?.avatarColor || '#128C7E',
+          avatarLetter: (senderMeta.avatarLetter || data?.avatarLetter || (senderMeta.userName ? senderMeta.userName.charAt(0).toUpperCase() : 'U')).substring(0, 1),
+          timestamp: Date.now(),
+          messageId: serverMessageId,
+          roomType: 'group',
+          roomId: groupName,
+        };
+
+        if (data.replyTo && typeof data.replyTo === 'object') {
+          const replyUserName = (data.replyTo.userName || data.replyTo.senderName || '').trim();
+          const finalReplyUserName = replyUserName || data.replyTo.userId || 'Unknown User';
+          messageData.replyTo = {
+            messageId: data.replyTo.messageId || null,
+            userName: finalReplyUserName.substring(0, 50),
+            message: data.replyTo.message || null,
+            timestamp: data.replyTo.timestamp || null,
+            mediaUrl: data.replyTo.mediaUrl || data.replyTo.media || data.replyTo.media_url || null,
+            mediaType: data.replyTo.mediaType || null,
+            senderProfileImagePath: data.replyTo.senderProfileImagePath || data.replyTo.profileImagePath || data.replyTo.profile_image_path || null,
+            avatarColor: data.replyTo.avatarColor || '#128C7E',
+            avatarLetter: ((data.replyTo.avatarLetter || finalReplyUserName.charAt(0).toUpperCase() || 'U').substring(0, 1)),
+            replyTo: data.replyTo.replyTo && typeof data.replyTo.replyTo === 'object'
+              ? _sanitizeNestedReply(data.replyTo.replyTo)
+              : null,
+          };
+        }
+
+        socket.to(`group_${groupName}`).emit('group_message', messageData);
+        if (callback) callback({ success: true, messageId: serverMessageId, timestamp: messageData.timestamp, data: messageData });
+        return;
+      }
+
+      if (roomType === 'connection' || roomType === 'direct') {
+        const targetRoomId = data.roomId || data.spaceId;
+        if (!targetRoomId) {
+          if (callback) callback({ success: false, error: 'Missing roomId for connection roomType' });
+          return;
+        }
+
+        const roomSet = io.sockets.adapter.rooms.get(targetRoomId);
+        if (!roomSet || !roomSet.has(socket.id)) {
+          if (callback) callback({ success: false, error: 'Not in this connection room' });
+          return;
+        }
+
+        const messageData = {
+          ...data,
+          roomType,
+          roomId: targetRoomId,
+          timestamp: Date.now(),
+          messageId: data.messageId || `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+          senderId: socketMetadata.get(socket.id)?.userId || data?.userId || null,
+          senderName: socketMetadata.get(socket.id)?.userName || data?.userName || 'Unknown User',
+        };
+
+        socket.to(targetRoomId).emit('room_message', messageData);
+        if (callback) callback({ success: true, messageId: messageData.messageId, data: messageData });
+        return;
+      }
+
+      if (callback) callback({ success: false, error: `Unsupported roomType: ${roomType}` });
+    } catch (error) {
+      Logger.error('send_room_message', 'Error routing room message', error.message);
+      if (callback) callback({ success: false, error: 'Failed to send room message' });
+    }
+  });
+
   // User leaves group
   socket.on('leave_group', (data, callback) => {
     try {
@@ -4384,6 +5680,51 @@ setInterval(() => {
       }
     } catch (e) {
       Logger.warn('cleanup', 'Error cleaning stale groupChatRooms', { err: e && e.message });
+    }
+    // ✅ NEW: Clean stale voice spaces
+    try {
+      for (const [spaceId, space] of Array.from(activeVoiceSpaces.entries())) {
+        // Remove participants whose sockets are gone
+        for (let i = space.participants.length - 1; i >= 0; i--) {
+          const participant = space.participants[i];
+          const participantSocketId = userSockets.get(participant.userId);
+          if (!participantSocketId || !io.sockets.sockets.has(participantSocketId) || !socketMetadata.has(participantSocketId)) {
+            space.participants.splice(i, 1);
+            userToSpaceMap.delete(participant.userId);
+            Logger.info('cleanup', `Removed offline participant ${participant.userId} from space ${spaceId}`);
+          }
+        }
+
+        // If host is offline (no socket) or host socket not present, and space is older than STALE_TIMEOUT, close it
+        const hostSocketId = userSockets.get(String(space.hostId));
+        const hostOnline = hostSocketId && io.sockets.sockets.has(hostSocketId);
+        const age = Date.now() - (space.createdAt || 0);
+        if (!hostOnline && age > CONFIG.STALE_TIMEOUT) {
+          Logger.info('cleanup', `Closing stale space ${spaceId} because host offline for ${Math.floor(age/1000)}s`);
+          try {
+            closeSpaceAsHost(spaceId, 'stale_host_offline');
+          } catch (err) {
+            Logger.warn('cleanup', `Failed to close stale space ${spaceId}`, { err: err && err.message });
+            // Fallback: remove space
+            activeVoiceSpaces.delete(spaceId);
+            broadcastActiveSpaces();
+          }
+          continue;
+        }
+
+        // If space has no participants left, delete it
+        if (!space.participants || space.participants.length === 0) {
+          activeVoiceSpaces.delete(spaceId);
+          Logger.info('cleanup', `Deleted empty voice space ${spaceId}`);
+          io.emit('space_closed', { spaceId });
+          broadcastActiveSpaces();
+        } else {
+          // Emit update to ensure participant counts stay current
+          emitSpaceUpdated(space);
+        }
+      }
+    } catch (e) {
+      Logger.warn('cleanup', 'Error cleaning stale voice spaces', { err: e && e.message });
     }
     
     broadcastStats();
