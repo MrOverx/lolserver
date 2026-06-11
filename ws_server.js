@@ -2232,6 +2232,59 @@ app.post('/user/:userId/update', validateProfileUpdate, async (req, res) => {
 });
 
 // ========== DELETE USER ACCOUNT ENDPOINTS ==========
+async function verifyDeleteCredentials(credentials = {}) {
+  const normalizedEmail = credentials.email ? String(credentials.email).trim().toLowerCase() : null;
+  const password = credentials.password;
+  const explicitUserId = credentials.userId || credentials.id;
+
+  if (!normalizedEmail || !password) {
+    const error = new Error('Email and password are required');
+    error.code = 'INVALID_CREDENTIALS';
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const lookup = { $or: [] };
+  if (explicitUserId) {
+    lookup.$or.push({ userId: String(explicitUserId).trim() });
+  }
+  if (normalizedEmail) {
+    lookup.$or.push({ email: normalizedEmail });
+  }
+
+  if (lookup.$or.length === 0) {
+    const error = new Error('Email and password are required');
+    error.code = 'INVALID_CREDENTIALS';
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const user = await User.findOne(lookup);
+  if (!user) {
+    const error = new Error('User not found');
+    error.code = 'USER_NOT_FOUND';
+    error.statusCode = 404;
+    throw error;
+  }
+
+  if (!user.passwordHash) {
+    const error = new Error('This account was created with Google sign-in and does not have a password. Please use Google sign-in or create a password first.');
+    error.code = 'PASSWORD_NOT_SET';
+    error.statusCode = 401;
+    throw error;
+  }
+
+  const validPassword = await bcrypt.compare(password, user.passwordHash);
+  if (!validPassword) {
+    const error = new Error('Invalid email or password');
+    error.code = 'INVALID_CREDENTIALS';
+    error.statusCode = 401;
+    throw error;
+  }
+
+  return user;
+}
+
 async function deleteUserAccount(userId, requestContext = {}) {
   const normalizedUserId = String(userId || '').trim();
 
@@ -2361,17 +2414,7 @@ app.post('/auth/verify-account', deleteAccountLimiter, async (req, res) => {
   }
 
   try {
-    const userId = req.body && (req.body.userId || req.body.id);
-    const normalizedUserId = String(userId || '').trim();
-
-    if (!normalizedUserId) {
-      return sendError(res, 400, 'User ID is required', 'INVALID_USER_ID');
-    }
-
-    const user = await User.findOne({ userId: normalizedUserId }).lean().exec();
-    if (!user) {
-      return sendError(res, 404, 'User not found', 'USER_NOT_FOUND');
-    }
+    const user = await verifyDeleteCredentials(req.body || {});
 
     return sendSuccess(res, {
       exists: true,
@@ -2382,7 +2425,9 @@ app.post('/auth/verify-account', deleteAccountLimiter, async (req, res) => {
     }, 'Account verified');
   } catch (err) {
     Logger.error('user/verify', 'Error verifying user account', err && err.message);
-    return sendError(res, 500, 'Error verifying user account', { details: err.message });
+    const statusCode = err && err.statusCode ? err.statusCode : 500;
+    const code = err && err.code ? err.code : 'INVALID_CREDENTIALS';
+    return sendError(res, statusCode, err && err.message ? err.message : 'Error verifying user account', code);
   }
 });
 
@@ -2392,8 +2437,8 @@ app.post('/auth/delete-account', deleteAccountLimiter, async (req, res) => {
   }
 
   try {
-    const userId = req.body && (req.body.userId || req.body.id);
-    const result = await deleteUserAccount(userId, { source: 'auth/delete-account', body: req.body });
+    const verifiedUser = await verifyDeleteCredentials(req.body || {});
+    const result = await deleteUserAccount(verifiedUser.userId, { source: 'auth/delete-account', body: req.body });
     return sendSuccess(res, result, 'User account deleted');
   } catch (err) {
     Logger.error('user/delete', 'Error deleting user account', err && err.message);
