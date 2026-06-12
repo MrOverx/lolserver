@@ -10,7 +10,7 @@
  * @param {string|object} errorCode - Error code or details object
  * @returns {object} Formatted error response
  */
-function sendError(res, statusCode, message, errorCode = null) {
+function sendError(res, statusCode, message, errorCode = null, details = null) {
   const response = { success: false, message, error: message };
   if (errorCode) {
     if (typeof errorCode === 'string') {
@@ -18,6 +18,9 @@ function sendError(res, statusCode, message, errorCode = null) {
     } else {
       Object.assign(response, errorCode);
     }
+  }
+  if (details) {
+    response.details = details;
   }
   return res.status(statusCode).json(response);
 }
@@ -53,8 +56,16 @@ function serializeUser(user, includeFields = null) {
     country: user.country,
     avatarColor: user.avatarColor,
     profileImageUrl: user.profileImageUrl,
+    pictureName: user.pictureName,
     likeCount: user.likeCount,
     starCount: user.starCount,
+    xp: user.xp,
+    profileComplete: user.profileComplete,
+    bio: user.bio,
+    status: user.status,
+    interests: user.interests,
+    birthDate: user.birthDate,
+    emailVerified: user.emailVerified,
     createdAt: user.createdAt,
     authType: user.authType,
     isGuest: user.isGuest,

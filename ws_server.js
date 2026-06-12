@@ -240,13 +240,11 @@ if (configuredDb !== 'lolcluster') {
   console.warn(`⚠️ MongoDB URI uses database '${configuredDb}'. Confirm this is the intended target.`);
 }
 
-console.log(`🔐 MongoDB URI loaded and targeting database: ${configuredDb}`);
+Logger.info('mongodb', `🔐 MongoDB URI targeting database: ${configuredDb}`);
 
 const MONGODB_CONFIG = {
   URI: MONGODB_URI,
   options: {
-    useNewUrlParser: true,
-    useUnifiedTopology: true,
     maxPoolSize: 10,
     minPoolSize: 2,
     socketTimeoutMS: 45000,
@@ -332,9 +330,6 @@ function startServer() {
       for (const [spaceId, space] of activeVoiceSpaces.entries()) {
         if (space.participants.length === 0 && (now - space.createdAt > SPACE_IDLE_TIMEOUT)) {
           activeVoiceSpaces.delete(spaceId);
-          for (const participant of space.participants) {
-            userToSpaceMap.delete(participant.userId);
-          }
           cleanedCount++;
         }
       }
@@ -348,8 +343,8 @@ function startServer() {
 
 // ========== MONGODB CONNECTION ==========
 const safeMongoUri = MONGODB_CONFIG.URI.replace(/^(mongodb(?:\+srv)?:\/\/)([^@]+@)?/, '$1****@');
-console.log('🔄 Connecting to MongoDB...');
-console.log(`📍 MongoDB Host: ${safeMongoUri}`);
+Logger.info('mongodb', '🔄 Connecting to MongoDB...');
+Logger.info('mongodb', `📍 MongoDB Host: ${safeMongoUri}`);
 
 // ✅ START SERVER IMMEDIATELY (don't wait for MongoDB)
 // This allows Cloud Run health check to pass while MongoDB connects in the background
@@ -368,10 +363,6 @@ Logger.info('mongodb', '🔄 Initializing MongoDB connection manager', {
     const reconnectLoop = async () => {
       if (!mongoDBManager.getConnectionStatus()) {
         connected = await mongoDBManager.reconnect(MONGODB_CONFIG.URI, MONGODB_CONFIG.options);
-        if (!connected && mongoDBManager.reconnectAttempts < mongoDBManager.maxReconnectAttempts) {
-          // Schedule next reconnection attempt
-          return;
-        }
       }
     };
 
@@ -474,6 +465,7 @@ const userSchema = new mongoose.Schema({
 
   // Stats & achievements
   xp: { type: Map, of: Number, default: {} },
+  lastDailyXpAwardedAt: { type: Date, default: null },
   
   // Account Status
   isActive: { type: Boolean, default: true, index: true },
@@ -843,7 +835,7 @@ app.post('/auth/validate-token', validateTokenLimiter, asyncHandler(async (req, 
 
     // ✅ Save or update user in MongoDB after Google validation
     const userId = tokenData.sub;
-    console.log('🔍 Token data sub:', tokenData.sub, 'type:', typeof tokenData.sub);
+    Logger.info('oauth/validate', '🔍 Token data sub', { sub: tokenData.sub, type: typeof tokenData.sub });
     const userParams = {
       userId,
       userName: userMeta?.displayName || tokenData.name || 'User',
@@ -2085,6 +2077,8 @@ app.post('/user/:userId/update', validateProfileUpdate, async (req, res) => {
       birthDate,
       authType,
       isGuest,
+      xp,
+      lastDailyXpAwardedAt,
     } = req.body;
 
     const hasStatus = Object.prototype.hasOwnProperty.call(req.body, 'status');
@@ -2123,12 +2117,30 @@ app.post('/user/:userId/update', validateProfileUpdate, async (req, res) => {
       updateData.status = normalizeStringInput(status, 150);
     }
 
+    // Bio and interests are NOT updated to MongoDB server (as requested)
+    /*
     if (hasBio) {
       updateData.bio = normalizeStringInput(bio, 500);
     }
 
     if (hasInterests) {
       updateData.interests = normalizeInterests(interests, 20) || [];
+    }
+    */
+
+    if (xp) {
+      updateData.xp = typeof xp === 'object' ? xp : {};
+    }
+
+    if (lastDailyXpAwardedAt) {
+      try {
+        const parsedXpDate = new Date(lastDailyXpAwardedAt);
+        if (!Number.isNaN(parsedXpDate.getTime())) {
+          updateData.lastDailyXpAwardedAt = parsedXpDate;
+        }
+      } catch (err) {
+        Logger.warn('user/update', 'Invalid lastDailyXpAwardedAt format ignored', { lastDailyXpAwardedAt });
+      }
     }
 
     if (avatarColor) {
@@ -2168,7 +2180,7 @@ app.post('/user/:userId/update', validateProfileUpdate, async (req, res) => {
       Logger.info('user/update', '✅ Profile marked as complete', { userId });
     }
 
-    const safeFields = ['email', 'userName', 'gender', 'country', 'status', 'bio', 'interests', 'avatarColor', 'profileImageUrl', 'pictureName', 'birthDate', 'authType', 'isGuest', 'xp', 'profileComplete', 'updatedAt'];
+    const safeFields = ['email', 'userName', 'gender', 'country', 'status', 'avatarColor', 'profileImageUrl', 'pictureName', 'birthDate', 'authType', 'isGuest', 'xp', 'lastDailyXpAwardedAt', 'profileComplete', 'updatedAt'];
     const safeUpdateData = {};
     for (const key of safeFields) {
       if (Object.prototype.hasOwnProperty.call(updateData, key)) {
@@ -4714,6 +4726,10 @@ io.on('connection', (socket) => {
   // Create a new voice space
   socket.on('create_space', async (data, callback) => {
     try {
+      console.log('🔵 [create_space] Event received from socket:', socket.id);
+      console.log('📤 [create_space] Payload:', JSON.stringify(data, null, 2));
+      console.log('✓ [create_space] Callback present?', typeof callback === 'function');
+      
       const incomingUser = data?.user || null;
       const incomingUserId = normalizeId(data.userId || incomingUser?.userId || socket.data?.userId);
       const userNamePayload = incomingUser?.userName || data.userName || socket.data?.userName;
@@ -4721,7 +4737,11 @@ io.on('connection', (socket) => {
       const spaceName = String(data.spaceName || 'Voice Space').substring(0, 100);
       const description = String(data.description || '').substring(0, 300);
 
+      console.log('📋 [create_space] Extracted userId:', userId);
+      console.log('📋 [create_space] Extracted spaceName:', spaceName);
+
       if (!userId) {
+        console.log('❌ [create_space] Missing userId, sending error callback');
         if (callback) callback({ success: false, error: 'Missing userId' });
         return;
       }
@@ -4761,6 +4781,7 @@ io.on('connection', (socket) => {
         (space) => String(space.hostId) === userId,
       );
       if (existingHostSpace) {
+        console.log('⚠️ [create_space] User already has active space:', existingHostSpace.spaceId);
         if (callback) callback({
           success: false,
           error: 'You already have one active voice space. Close it before creating a new one.',
@@ -4768,7 +4789,9 @@ io.on('connection', (socket) => {
         return;
       }
 
+      console.log('🔄 [create_space] Calling resolveUserProfileMetadata for userId:', userId);
       const profileMeta = await resolveUserProfileMetadata(userId, userMeta, userNamePayload || 'Host', '#8A2BE2', 'H');
+      console.log('✅ [create_space] profileMeta resolved:', profileMeta?.userName);
 
       // Generate unique spaceId
       const spaceId = `space_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -4811,7 +4834,9 @@ io.on('connection', (socket) => {
       // Broadcast updated spaces list to ALL clients
       broadcastActiveSpaces();
 
+      console.log('📞 [create_space] About to send success callback for spaceId:', spaceId);
       if (callback) {
+        console.log('✅ [create_space] Callback exists, sending success response');
         callback({
           success: true,
           space: {
@@ -4827,10 +4852,24 @@ io.on('connection', (socket) => {
           },
           assignedRole: 'Host',
         });
+        console.log('✅ [create_space] Callback completed for spaceId:', spaceId);
+      } else {
+        console.log('❌ [create_space] Callback is null/undefined, cannot send response!');
       }
     } catch (error) {
+      console.error('❌ [create_space] ERROR CAUGHT:', {
+        message: error.message,
+        stack: error.stack,
+        code: error.code,
+        name: error.name,
+      });
       Logger.error('create_space', 'Error creating space', error.message);
-      if (callback) callback({ success: false, error: error.message });
+      if (callback) {
+        console.log('❌ [create_space] Sending error callback:', error.message);
+        callback({ success: false, error: error.message });
+      } else {
+        console.log('❌ [create_space] ERROR: No callback to send error response!');
+      }
     }
   });
 

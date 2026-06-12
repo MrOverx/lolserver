@@ -117,13 +117,17 @@ function startCleanupInterval() {
 
 /**
  * Get current rate limit status for a key
+ * @param {string} name - Rate limiter name
+ * @param {string} ip - IP address
+ * @param {string} [userId] - Optional user ID
+ * @param {number} [maxRequests] - Max allowed requests (default 100)
  */
-function getRateLimitStatus(name, ip, userId = 'anonymous') {
+function getRateLimitStatus(name, ip, userId = 'anonymous', maxRequests = 100) {
   const key = `${name}:${ip}:${userId}`;
   const record = requestLimits.get(key);
-  
+
   return {
-    limited: false,
+    limited: record ? record.count >= maxRequests : false,
     currentCount: record?.count || 0,
     resetTime: record?.resetTime || null,
   };

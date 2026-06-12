@@ -52,7 +52,6 @@ class UserCache {
     this.cache.set(userId, {
       data: userData,
       expiresAt: Date.now() + this.ttlMs,
-      createdAt: Date.now(),
     });
 
     if (this.cache.size > this.maxEntries) {

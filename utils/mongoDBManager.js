@@ -30,9 +30,7 @@ class MongoDBManager {
 
     // Default options with optimizations
     const defaultOptions = {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
-      maxPoolSize: 15, // ✅ Increased pool size for more concurrent connections
+      maxPoolSize: 15,
       minPoolSize: 5,
       socketTimeoutMS: 45000,
       serverSelectionTimeoutMS: 5000,
