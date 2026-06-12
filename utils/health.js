@@ -93,6 +93,7 @@ class HealthMonitor {
       memory: `${this.metrics.memoryUsage.toFixed(2)}MB`,
       nodeVersion: process.version,
       environment: process.env.NODE_ENV || 'development',
+      version: process.env.SERVER_VERSION || require('../package.json').version || '1.0.0',
       services,
     };
   }

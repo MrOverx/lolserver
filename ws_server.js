@@ -138,7 +138,7 @@ if (allowedOriginsSet.size === 0) {
   allowedOriginsSet.delete('*');
 }
 
-const isLocalhostOrigin = (origin) => /^https?:\/\/localhost(:\d+)?$/.test(origin);
+const isLocalhostOrigin = (origin) => /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
 const normalizeOrigin = (origin) => {
   if (!origin) return null;
   try {
@@ -149,24 +149,39 @@ const normalizeOrigin = (origin) => {
 };
 
 const isAllowedOrigin = (origin) => {
+  // No origin (like from non-browser clients) is allowed
   if (!origin) return true;
 
   const normalizedOrigin = normalizeOrigin(origin);
   if (!normalizedOrigin) return true;
 
-  if (allowedOriginsSet.has(normalizedOrigin) || allowedOriginsSet.has('*')) return true;
-  if (process.env.NODE_ENV === 'development' && isLocalhostOrigin(normalizedOrigin)) return true;
-
-  if (process.env.NODE_ENV !== 'development' && (allowedOriginsSet.size === 0 || process.env.CORS_ALLOW_ALL === 'true')) {
+  // Check if origin is in explicit allowed list
+  if (allowedOriginsSet.has(normalizedOrigin) || allowedOriginsSet.has('*')) {
     return true;
   }
 
+  // Always allow localhost in development (critical for local testing)
+  if (process.env.NODE_ENV === 'development' && isLocalhostOrigin(normalizedOrigin)) {
+    return true;
+  }
+
+  // Check hostname patterns for AWS/deployment services
   try {
     const hostname = new URL(normalizedOrigin).hostname;
-    if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname.endsWith('.localhost')) return true;
-    if (hostname.endsWith('.amazonaws.com') || hostname.endsWith('.elasticbeanstalk.com') || hostname.endsWith('.app.github.dev')) return true;
+    if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname.endsWith('.localhost')) {
+      return true;
+    }
+    if (hostname.endsWith('.amazonaws.com') || hostname.endsWith('.elasticbeanstalk.com') || hostname.endsWith('.app.github.dev')) {
+      return true;
+    }
   } catch (error) {
-    // Ignore malformed origin values and fall back to rejection below.
+    // Ignore malformed origin values
+  }
+
+  // In development, allow all origins as a last resort (for Flutter web testing)
+  if (process.env.NODE_ENV === 'development') {
+    Logger.warn('cors', `Development mode: allowing origin despite not being in list: ${origin}`);
+    return true;
   }
 
   return false;
@@ -174,8 +189,11 @@ const isAllowedOrigin = (origin) => {
 
 const corsOptions = {
   origin: (origin, callback) => {
-    if (isAllowedOrigin(origin)) return callback(null, true);
+    if (isAllowedOrigin(origin)) {
+      return callback(null, true);
+    }
 
+    // Log blocked origins for debugging
     try {
       Logger.warn('cors', `Blocked origin: ${origin}`);
     } catch (e) {
@@ -184,9 +202,13 @@ const corsOptions = {
 
     return callback(new Error('CORS policy: Origin not allowed'));
   },
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'HEAD'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
+  exposedHeaders: ['Content-Type'],
   credentials: true,
+  preflightContinue: false,
+  optionsSuccessStatus: 200, // For legacy browsers
+  maxAge: 86400, // Cache preflight for 24 hours
 };
 
 // ✅ Add JSON parsing middleware with compression
