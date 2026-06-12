@@ -599,8 +599,21 @@ function emitSpaceUpdated(space) {
   }
 }
 
+// Helper to add timeout to async operations (prevents hanging requests)
+function withTimeout(promise, timeoutMs = 5000) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`Operation timeout after ${timeoutMs}ms`)), timeoutMs)
+    ),
+  ]).catch(err => {
+    Logger.warn('withTimeout', 'Promise timed out or failed', { error: err.message, timeoutMs });
+    return null;
+  });
+}
+
 async function resolveUserProfileMetadata(userId, userMeta = {}, fallbackName = 'Guest', defaultColor = '#128C7E', defaultInitial = 'U') {
-  const freshProfile = await getFreshUserProfile(userId).catch(() => null);
+  const freshProfile = await withTimeout(getFreshUserProfile(userId), 5000);
   const userName = freshProfile?.userName || userMeta.userName || fallbackName;
   const avatarLetter = freshProfile?.userName ? freshProfile.userName.charAt(0).toUpperCase() : (userMeta.avatarLetter || defaultInitial);
   const avatarColor = freshProfile?.avatarColor || userMeta.avatarColor || defaultColor;
@@ -4725,6 +4738,22 @@ io.on('connection', (socket) => {
 
   // Create a new voice space
   socket.on('create_space', async (data, callback) => {
+    let callbackCalled = false;
+    const callbackOnce = (response) => {
+      if (!callbackCalled && typeof callback === 'function') {
+        callbackCalled = true;
+        callback(response);
+      }
+    };
+
+    // Safety timeout: guarantee response within 10 seconds
+    const timeoutId = setTimeout(() => {
+      if (!callbackCalled) {
+        console.error('❌ [create_space] TIMEOUT: Callback not called after 10s');
+        callbackOnce({ success: false, error: 'Server operation timed out' });
+      }
+    }, 10000);
+
     try {
       console.log('🔵 [create_space] Event received from socket:', socket.id);
       console.log('📤 [create_space] Payload:', JSON.stringify(data, null, 2));
@@ -4742,7 +4771,8 @@ io.on('connection', (socket) => {
 
       if (!userId) {
         console.log('❌ [create_space] Missing userId, sending error callback');
-        if (callback) callback({ success: false, error: 'Missing userId' });
+        clearTimeout(timeoutId);
+        callbackOnce({ success: false, error: 'Missing userId' });
         return;
       }
 
@@ -4782,7 +4812,8 @@ io.on('connection', (socket) => {
       );
       if (existingHostSpace) {
         console.log('⚠️ [create_space] User already has active space:', existingHostSpace.spaceId);
-        if (callback) callback({
+        clearTimeout(timeoutId);
+        callbackOnce({
           success: false,
           error: 'You already have one active voice space. Close it before creating a new one.',
         });
@@ -4835,27 +4866,24 @@ io.on('connection', (socket) => {
       broadcastActiveSpaces();
 
       console.log('📞 [create_space] About to send success callback for spaceId:', spaceId);
-      if (callback) {
-        console.log('✅ [create_space] Callback exists, sending success response');
-        callback({
-          success: true,
-          space: {
-            spaceId: newSpace.spaceId,
-            name: newSpace.name,
-            description: newSpace.description,
-            hostId: newSpace.hostId,
-            hostName: newSpace.hostName,
-            speakerLimit: newSpace.speakerLimit,
-            roomType: newSpace.roomType,
-            currentSpeakers: newSpace.participants.filter((p) => p.role === 'Speaker').length,
-            currentListeners: newSpace.participants.filter((p) => p.role === 'Listener').length,
-          },
-          assignedRole: 'Host',
-        });
-        console.log('✅ [create_space] Callback completed for spaceId:', spaceId);
-      } else {
-        console.log('❌ [create_space] Callback is null/undefined, cannot send response!');
-      }
+      clearTimeout(timeoutId);
+      console.log('✅ [create_space] Sending success response');
+      callbackOnce({
+        success: true,
+        space: {
+          spaceId: newSpace.spaceId,
+          name: newSpace.name,
+          description: newSpace.description,
+          hostId: newSpace.hostId,
+          hostName: newSpace.hostName,
+          speakerLimit: newSpace.speakerLimit,
+          roomType: newSpace.roomType,
+          currentSpeakers: newSpace.participants.filter((p) => p.role === 'Speaker').length,
+          currentListeners: newSpace.participants.filter((p) => p.role === 'Listener').length,
+        },
+        assignedRole: 'Host',
+      });
+      console.log('✅ [create_space] Callback completed for spaceId:', spaceId);
     } catch (error) {
       console.error('❌ [create_space] ERROR CAUGHT:', {
         message: error.message,
@@ -4864,12 +4892,9 @@ io.on('connection', (socket) => {
         name: error.name,
       });
       Logger.error('create_space', 'Error creating space', error.message);
-      if (callback) {
-        console.log('❌ [create_space] Sending error callback:', error.message);
-        callback({ success: false, error: error.message });
-      } else {
-        console.log('❌ [create_space] ERROR: No callback to send error response!');
-      }
+      clearTimeout(timeoutId);
+      console.log('❌ [create_space] Sending error callback:', error.message);
+      callbackOnce({ success: false, error: error.message });
     }
   });
 
@@ -5720,7 +5745,7 @@ io.on('connection', (socket) => {
     }
   });
 
-});
+}); // Close io.on('connection')
 
 // ========== CLEANUP & MAINTENANCE ==========
 setInterval(() => {
