@@ -431,9 +431,9 @@ const io = socketIO(server, {
   // Allow older engine.io v3 clients (mobile clients may use older engines)
   allowEIO3: true,
 
-  // ✅ OPTIMIZED: Connection timing
-  pingInterval: 25000,  // Check connection every 25s
-  pingTimeout: 10000,    // Wait 10s for pong before disconnecting
+  // ✅ OPTIMIZED: Connection timing for faster dead-connection detection
+  pingInterval: 10000,  // Check connection every 10s
+  pingTimeout: 5000,    // Wait 5s for pong before disconnecting
 
   // ✅ CRITICAL FIX: Payload settings
   // Increased from 100KB to 5MB to allow profile images in register_user payload

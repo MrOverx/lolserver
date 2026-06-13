@@ -1,6 +1,6 @@
 {
   "name": "lolserver",
-  "version": "1.36.0",
+  "version": "1.39.0",
   "main": "ws_server.js",
   "scripts": {
     "start": "node ws_server.js",
